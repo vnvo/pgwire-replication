@@ -1,14 +1,26 @@
 use std::fmt;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseLsnError(pub String);
+
+impl std::fmt::Display for ParseLsnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid LSN: {}", self.0)
+    }
+}
+impl std::error::Error for ParseLsnError {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
-    pub fn parse(s: &str) -> Option<Lsn> {
+    pub fn parse(s: &str) -> Result<Lsn, ParseLsnError> {
         let mut parts = s.split('/');
-        let hi = u64::from_str_radix(parts.next()?, 16).ok()?;
-        let lo = u64::from_str_radix(parts.next()?, 16).ok()?;
-        Some(Lsn((hi << 32) | lo))
+        let hi = parts.next().ok_or_else(|| ParseLsnError(s.into()))?;
+        let lo = parts.next().ok_or_else(|| ParseLsnError(s.into()))?;
+        let hi = u64::from_str_radix(hi, 16).map_err(|_| ParseLsnError(s.into()))?;
+        let lo = u64::from_str_radix(lo, 16).map_err(|_| ParseLsnError(s.into()))?;
+        Ok(Lsn((hi << 32) | lo))
     }
 
     pub fn to_pg_string(self) -> String {
