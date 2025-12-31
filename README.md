@@ -4,7 +4,7 @@ A low-level, high-performance PostgreSQL logical replication client implemented 
 
 This crate is designed for **CDC, change streaming, and WAL replay systems** that require explicit control over replication state, deterministic restart behavior, and minimal runtime overhead.
 
-`pgwire-replication` intentionally avoids `libpq`, `tokio-postgres`, and other higher-level PostgreSQL clients for the replication path. It relies on `START_REPLICATION ... LOGICAL ...` and the built-in `pgoutput` output plugin.
+`pgwire-replication` intentionally avoids `libpq`, `tokio-postgres`, and other higher-level PostgreSQL clients for the replication path. It interacts with a Postgres instance directly and relies on `START_REPLICATION ... LOGICAL ...` and the built-in `pgoutput` output plugin.
 
 
 `pgwire-replication` exists to provide:
@@ -15,7 +15,7 @@ This crate is designed for **CDC, change streaming, and WAL replay systems** tha
 
 This crate was originally extracted from the Deltaforge CDC project and is maintained independently.
 
----
+
 
 ## Features
 
@@ -26,7 +26,7 @@ This crate was originally extracted from the Deltaforge CDC project and is maint
 - Periodic standby status updates
 - Keepalive handling
 - Tokio-based async client
-- Optional TLS support (rustls)
+- TLS/mTLS support (via rustls)
 - Designed for checkpoint and replay-based systems
 
 ## Non-goals
@@ -41,7 +41,7 @@ This crate intentionally does **not** provide:
 
 These responsibilities belong in higher layers.
 
----
+
 ## Basic usage
 
 ```rust
@@ -60,6 +60,8 @@ while let Ok(event) = repl.recv().await {
     }
 }
 ```
+
+Check the **Quick Start** and **Examples** for more detailed use cases.
 
 ## Seek and Replay Semantics
 
@@ -209,19 +211,21 @@ async fn main() -> anyhow::Result<()> {
 
 Examples that use the control-plane SQL client (`tokio-postgres`) require the `examples` feature.
 
-- Replication plane only: `examples/basic.rs`
+### Replication plane only: `examples/basic.rs`
 ```bash
 START_LSN="0/16B6C50" cargo run --example basic
 ```
-- Control-plane + streaming: `examples/checkpointed.rs`
+
+### Control-plane + streaming: `examples/checkpointed.rs`
 ```bash
 cargo run --example checkpointed --features examples
 ```
-- Bounded replay: `examples/bounded_replay.rs`
+
+### Bounded replay: `examples/bounded_replay.rs`
 ```bash
 cargo run --example bounded_replay --features examples
 ```
-- With TLS enabled: `examples/with_tls.rs`
+### With TLS enabled: `examples/with_tls.rs`
 ```bash
 PGHOST=db.example.com \
 PGPORT=5432 \
@@ -234,6 +238,32 @@ PGTLS_CA=/path/to/ca.pem \
 PGTLS_SNI=db.example.com \
 cargo run --example tls --features examples
 ```
+
+### Enabling mTLS : `examples/with_mtls.rs`
+Inject the fake dns record, if you need to:
+```bash
+sudo sh -c 'echo "127.0.0.1 db.example.com" >> /etc/hosts'
+```
+and then:
+```bash
+PGHOST=db.example.com \
+PGPORT=5432 \
+PGUSER=repl_user \
+PGPASSWORD=secret \
+PGDATABASE=postgres \
+PGSLOT=example_slot_mtls \
+PGPUBLICATION=example_pub_mtls \
+PGTLS_CA=/etc/ssl/ca.pem \
+PGTLS_CLIENT_CERT=/etc/ssl/client.crt.pem \
+PGTLS_CLIENT_KEY=/etc/ssl/client.key.pem \
+PGTLS_SNI=db.example.com \
+cargo run --example mtls --features examples
+```
+- `PGUSER/PGPASSWORD` are used for control-plane setup (publication/slot).
+- `REPL_USER/REPL_PASSWORD` are used for the replication stream.
+- If PGHOST is an **IP address**, you must set `PGTLS_SNI` to a DNS name on the cert.
+- Client key should be **PKCS#8 PEM** for best compatibility.
+- `VerifyCa` can be used instead of `VerifyFull` if hostname validation is not possible.
 
 
 # Testing

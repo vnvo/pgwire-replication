@@ -4,7 +4,7 @@
 mod common;
 
 use pgwire_replication::{
-    client::ReplicationEvent, ReplicationClient, ReplicationConfig, SslMode, TlsConfig,
+    ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
 };
 use std::path::PathBuf;
 

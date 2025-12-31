@@ -6,7 +6,7 @@
 mod common;
 
 use pgwire_replication::{
-    client::ReplicationEvent, Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig,
+    Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
 };
 
 fn env(name: &str, default: &str) -> String {
@@ -14,7 +14,9 @@ fn env(name: &str, default: &str) -> String {
 }
 
 async fn current_wal_lsn(sql: &tokio_postgres::Client) -> anyhow::Result<Lsn> {
-    let row = sql.query_one("SELECT pg_current_wal_lsn()::text", &[]).await?;
+    let row = sql
+        .query_one("SELECT pg_current_wal_lsn()::text", &[])
+        .await?;
     let s: String = row.get(0);
     Ok(Lsn::parse(&s)?)
 }
@@ -43,7 +45,13 @@ async fn main() -> anyhow::Result<()> {
         user: user.into(),
         password: password.into(),
         database: database.into(),
-        tls: TlsConfig { mode: SslMode::Disable, ca_pem_path: None, sni_hostname: None },
+        tls: TlsConfig {
+            mode: SslMode::Disable,
+            ca_pem_path: None,
+            sni_hostname: None,
+            client_cert_pem_path: None,
+            client_key_pem_path: None,
+        },
 
         slot: slot.into(),
         publication: publication.into(),
@@ -63,7 +71,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("XLogData wal_end={wal_end} bytes={}", data.len());
                 repl.update_applied_lsn(wal_end);
             }
-            ReplicationEvent::KeepAlive { wal_end, reply_requested, .. } => {
+            ReplicationEvent::KeepAlive {
+                wal_end,
+                reply_requested,
+                ..
+            } => {
                 println!("KeepAlive wal_end={wal_end} reply_requested={reply_requested}");
             }
             ReplicationEvent::StoppedAt { reached } => {

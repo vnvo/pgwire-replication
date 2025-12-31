@@ -6,7 +6,7 @@
 mod common;
 
 use pgwire_replication::{
-    client::ReplicationEvent, ReplicationClient, ReplicationConfig, SslMode, TlsConfig,
+    ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
 };
 
 fn env(name: &str, default: &str) -> String {
@@ -34,7 +34,13 @@ async fn main() -> anyhow::Result<()> {
         user: user.into(),
         password: password.into(),
         database: database.into(),
-        tls: TlsConfig { mode: SslMode::Disable, ca_pem_path: None, sni_hostname: None },
+        tls: TlsConfig {
+            mode: SslMode::Disable,
+            ca_pem_path: None,
+            sni_hostname: None,
+            client_cert_pem_path: None,
+            client_key_pem_path: None,
+        },
 
         slot: slot.into(),
         publication: publication.into(),
@@ -54,7 +60,11 @@ async fn main() -> anyhow::Result<()> {
                 println!("XLogData wal_end={wal_end} bytes={}", data.len());
                 repl.update_applied_lsn(wal_end);
             }
-            ReplicationEvent::KeepAlive { wal_end, reply_requested, .. } => {
+            ReplicationEvent::KeepAlive {
+                wal_end,
+                reply_requested,
+                ..
+            } => {
                 println!("KeepAlive wal_end={wal_end} reply_requested={reply_requested}");
             }
             ReplicationEvent::StoppedAt { reached } => {

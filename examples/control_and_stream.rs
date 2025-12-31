@@ -1,6 +1,6 @@
 use anyhow::Context;
 use pgwire_replication::{
-    client::ReplicationEvent, Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig,
+    Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
 };
 use tokio_postgres::NoTls;
 
@@ -21,16 +21,16 @@ async fn control_plane_get_start_lsn(
     let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
         .await
         .context("connect (control plane)")?;
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
 
     // Minimal setup example. In real systems you will likely do:
     // - CREATE TABLE ...
     // - CREATE PUBLICATION ...
     // - SELECT pg_create_logical_replication_slot(...) ...
     client
-        .batch_execute(&format!(
-            "CREATE PUBLICATION {publication} FOR ALL TABLES;"
-        ))
+        .batch_execute(&format!("CREATE PUBLICATION {publication} FOR ALL TABLES;"))
         .await
         .ok(); // ignore if already exists or you manage pubs elsewhere
 
@@ -84,11 +84,10 @@ async fn main() -> anyhow::Result<()> {
     let slot = "my_slot";
     let publication = "my_pub";
 
-    let start_lsn = control_plane_get_start_lsn(
-        host, port, user, password, database, slot, publication,
-    )
-    .await?;
-    
+    let start_lsn =
+        control_plane_get_start_lsn(host, port, user, password, database, slot, publication)
+            .await?;
+
     println!("got start lsn = {start_lsn}");
 
     let cfg = ReplicationConfig {
@@ -101,6 +100,8 @@ async fn main() -> anyhow::Result<()> {
             mode: SslMode::Disable,
             ca_pem_path: None,
             sni_hostname: None,
+            client_cert_pem_path: None,
+            client_key_pem_path: None,
         },
 
         slot: slot.into(),
@@ -125,7 +126,11 @@ async fn main() -> anyhow::Result<()> {
                 // Report progress so WAL can be released and feedback remains correct
                 repl.update_applied_lsn(wal_end);
             }
-            ReplicationEvent::KeepAlive { wal_end, reply_requested, .. } => {
+            ReplicationEvent::KeepAlive {
+                wal_end,
+                reply_requested,
+                ..
+            } => {
                 println!("KeepAlive wal_end={wal_end} reply_requested={reply_requested}");
             }
             ReplicationEvent::StoppedAt { reached } => {
