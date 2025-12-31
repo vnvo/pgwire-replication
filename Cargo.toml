@@ -17,7 +17,7 @@ keywords = [
 ]
 categories = ["database", "network-programming", "asynchronous"]
 repository = "https://github.com/vnvo/pgwire-replication"
-homepage = "https://github.com/your-org/pgwire-replication"
+homepage = "https://github.com/vnvo/pgwire-replication"
 documentation = "https://docs.rs/pgwire-replication"
 readme = "README.md"
 
