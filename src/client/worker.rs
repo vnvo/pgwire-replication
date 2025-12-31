@@ -221,23 +221,23 @@ impl WorkerState {
                 data,
             } => {
                 // Check stop condition
-                if let Some(stop_lsn) = self.cfg.stop_at_lsn {
-                    if wal_end >= stop_lsn {
-                        // Send final event, then stop signal
-                        self.send_event(Ok(ReplicationEvent::XLogData {
-                            wal_start,
-                            wal_end,
-                            server_time_micros,
-                            data,
-                        }))
+                if let Some(stop_lsn) = self.cfg.stop_at_lsn
+                    && wal_end >= stop_lsn
+                {
+                    // Send final event, then stop signal
+                    self.send_event(Ok(ReplicationEvent::XLogData {
+                        wal_start,
+                        wal_end,
+                        server_time_micros,
+                        data,
+                    }))
+                    .await;
+
+                    self.send_event(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
                         .await;
 
-                        self.send_event(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
-                            .await;
-
-                        let _ = write_copy_done(stream).await;
-                        return Ok(true);
-                    }
+                    let _ = write_copy_done(stream).await;
+                    return Ok(true);
                 }
 
                 self.send_event(Ok(ReplicationEvent::XLogData {

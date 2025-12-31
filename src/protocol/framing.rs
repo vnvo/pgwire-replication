@@ -175,7 +175,7 @@ mod tests {
 
         let msg = read_backend_message(&mut cursor).await.unwrap();
         assert_eq!(msg.tag, b'Z');
-        assert_eq!(&msg.payload[..], &[b'I']);
+        assert_eq!(&msg.payload[..], b"I");
         assert!(msg.is_ready_for_query());
     }
 
@@ -312,7 +312,7 @@ mod tests {
 
         let ready = BackendMessage {
             tag: b'Z',
-            payload: Bytes::from_static(&[b'I']),
+            payload: Bytes::from_static(b"I"),
         };
         assert!(ready.is_ready_for_query());
         assert!(!ready.is_error());

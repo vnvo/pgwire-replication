@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn timestamp_conversion_roundtrip() {
-        let unix_micros = 1704067200_000_000i64; // 2024-01-01 00:00:00 UTC
+        let unix_micros = 1_704_067_200_000_000_i64; // 2024-01-01 00:00:00 UTC
 
         let pg_time = unix_to_pg_timestamp(unix_micros);
         let back = pg_to_unix_timestamp(pg_time);
