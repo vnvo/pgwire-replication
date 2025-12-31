@@ -30,6 +30,19 @@ pub struct TlsConfig {
     pub client_key_pem_path: Option<PathBuf>,
 }
 
+impl TlsConfig {
+    /// TLS disabled mode config helper
+    pub fn disabled() -> Self {
+        Self {
+            mode: SslMode::Disable,
+            ca_pem_path: None,
+            sni_hostname: None,
+            client_cert_pem_path: None,
+            client_key_pem_path: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplicationConfig {
     pub host: String,

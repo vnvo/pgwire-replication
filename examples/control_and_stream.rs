@@ -4,7 +4,7 @@
 
 use anyhow::Context;
 use pgwire_replication::{
-    Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
+    Lsn, ReplicationClient, ReplicationConfig, TlsConfig, client::ReplicationEvent,
 };
 
 use tokio_postgres::NoTls;
@@ -91,14 +91,7 @@ pub async fn main() -> anyhow::Result<()> {
         user: user.into(),
         password: password.into(),
         database: database.into(),
-        tls: TlsConfig {
-            mode: SslMode::Disable,
-            ca_pem_path: None,
-            sni_hostname: None,
-            client_cert_pem_path: None,
-            client_key_pem_path: None,
-        },
-
+        tls: TlsConfig::disabled(),
         slot: slot.into(),
         publication: publication.into(),
         start_lsn,

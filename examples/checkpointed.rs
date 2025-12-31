@@ -6,7 +6,7 @@
 mod common;
 
 use pgwire_replication::{
-    ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
+    ReplicationClient, ReplicationConfig, TlsConfig, client::ReplicationEvent,
 };
 
 fn env(name: &str, default: &str) -> String {
@@ -34,13 +34,7 @@ async fn main() -> anyhow::Result<()> {
         user,
         password,
         database,
-        tls: TlsConfig {
-            mode: SslMode::Disable,
-            ca_pem_path: None,
-            sni_hostname: None,
-            client_cert_pem_path: None,
-            client_key_pem_path: None,
-        },
+        tls: TlsConfig::disabled(),
         slot,
         publication,
         start_lsn,

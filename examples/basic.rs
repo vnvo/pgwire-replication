@@ -3,7 +3,7 @@
 // START_LSN="0/16B6C50" cargo run --example basic --features examples
 
 use pgwire_replication::{
-    Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
+    Lsn, ReplicationClient, ReplicationConfig, TlsConfig, client::ReplicationEvent,
 };
 
 fn env(name: &str, default: &str) -> String {
@@ -29,14 +29,7 @@ pub async fn main() -> anyhow::Result<()> {
         user,
         password,
         database,
-        tls: TlsConfig {
-            mode: SslMode::Disable,
-            ca_pem_path: None,
-            sni_hostname: None,
-            client_cert_pem_path: None,
-            client_key_pem_path: None,
-        },
-
+        tls: TlsConfig::disabled(),
         slot,
         publication,
         start_lsn,
