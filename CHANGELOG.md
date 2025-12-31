@@ -7,36 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [0.1.0] – 2025-12-31
+## [0.1.0] - 2025-12-31
 
 ### Added
 - Initial release of `pgwire-replication`
-- Logical replication over PostgreSQL wire protocol (pgwire)
+- Tokio-based async PostgreSQL logical replication client
+- PostgreSQL wire protocol (pgwire) implementation
+- SCRAM-SHA-256 authentication (default)
+- MD5 authentication (optional, feature-gated)
+- TLS support via rustls with modes: disable, require, verify-ca, verify-full
+- Mutual TLS (mTLS) client certificate support
 - Explicit replication start via `start_lsn`
 - Bounded replay via `stop_at_lsn`
 - Periodic standby status updates (feedback)
-- Keepalive handling
-- Clean replication shutdown using `CopyDone`
-- Tokio-based async replication client
-- Optional TLS and mTLS support using `rustls`
+- Keepalive handling with automatic replies
+- Clean shutdown using `CopyDone`
 - Integration tests using Docker (`testcontainers`)
-- End-to-end tests covering:
-  - keepalive handling
-  - LSN seek behavior
-  - bounded replay semantics
-  - clean shutdown behavior
 
 ### Notes
-- pgoutput payloads are currently treated as opaque bytes.
-- Replay bounds are evaluated using WAL positions observed during streaming.
-- Commit-boundary semantics may be added in a future release.
+- pgoutput payloads are returned as opaque bytes (no parsing yet)
+- Replay bounds use WAL positions observed during streaming
 
 ---
-
-## [Unreleased]
 
 ### Planned
 - Commit-boundary LSN extraction from pgoutput
 - Stronger replay guarantees based on commit end LSN
 - Additional pgoutput message parsing helpers
 - Fuzz testing for pgwire framing
+
+
+[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.1.0
