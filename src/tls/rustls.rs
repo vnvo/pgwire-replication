@@ -160,7 +160,7 @@ pub async fn maybe_upgrade_to_tls(
 
     // Install crypto provider (required for rustls 0.23+)
     // This is idempotent - safe to call multiple times
-    let _ = rustls::crypto::ring::default_provider().install_default();    
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // PostgreSQL TLS negotiation: send SSLRequest, expect 'S' or 'N'
     write_ssl_request(&mut tcp).await?;
