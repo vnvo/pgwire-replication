@@ -1,5 +1,9 @@
 # pgwire-replication
 
+[![Crates.io](https://img.shields.io/crates/v/pgwire-replication.svg)](https://crates.io/crates/pgwire-replication)
+[![Documentation](https://docs.rs/pgwire-replication/badge.svg)](https://docs.rs/pgwire-replication)
+[![License](https://img.shields.io/crates/l/pgwire-replication.svg)](LICENSE)
+
 A low-level, high-performance PostgreSQL logical replication client implemented directly on top of the PostgreSQL wire protocol (pgwire).
 
 This crate is designed for **CDC, change streaming, and WAL replay systems** that require explicit control over replication state, deterministic restart behavior, and minimal runtime overhead.
@@ -15,7 +19,24 @@ This crate is designed for **CDC, change streaming, and WAL replay systems** tha
 
 This crate was originally extracted from the Deltaforge CDC project and is maintained independently.
 
+## Installation
 
+Add to your `Cargo.toml`:
+```toml
+[dependencies]
+pgwire-replication = "0.1"
+```
+
+Or with specific features:
+```toml
+[dependencies]
+pgwire-replication = { version = "0.1", default-features = false, features = ["tls-rustls"] }
+```
+
+## Requirements
+
+- Rust 1.89 or later
+- PostgreSQL 15+ with logical replication enabled
 
 ## Features
 
@@ -26,6 +47,7 @@ This crate was originally extracted from the Deltaforge CDC project and is maint
 - Periodic standby status updates
 - Keepalive handling
 - Tokio-based async client
+- SCRAM-SHA-256 and MD5 authentication
 - TLS/mTLS support (via rustls)
 - Designed for checkpoint and replay-based systems
 
@@ -56,7 +78,7 @@ while let Ok(event) = repl.recv().await {
             repl.update_applied_lsn(wal_end);
         }
         ReplicationEvent::KeepAlive { .. } => {}
-        ReplicationEvent::StoppedAt { .. } => break,
+        ReplicationEvent::StoppedAt { reached } => break,
     }
 }
 ```
@@ -104,7 +126,7 @@ When configured:
 This enables:
 - deterministic WAL replay
 - offline backfills
-- “replay up to checkpoint” workflows
+- "replay up to checkpoint" workflows
 - controlled reprocessing in recovery scenarios
 
 
@@ -141,7 +163,7 @@ TLS configuration is provided explicitly via `ReplicationConfig` and does not re
 ## Quick start
 
 Control plane (publication/slot creation) is typically done using a proper "Postgres client" (Your choice).
-This crate is the replication plane without using any of those clients.
+This crate handles only the replication plane.
 
 ```rust
 use pgwire_replication::{
@@ -165,12 +187,7 @@ async fn main() -> anyhow::Result<()> {
         user: "postgres".into(),
         password: "postgres".into(),
         database: "postgres".into(),
-        tls: TlsConfig {
-            mode: SslMode::Disable,
-            ca_pem_path: None,
-            sni_hostname: None,
-        },
-
+        tls: TlsConfig::disabled(),
         slot: "my_slot".into(),
         publication: "my_pub".into(),
         start_lsn,
@@ -218,12 +235,12 @@ START_LSN="0/16B6C50" cargo run --example basic
 
 ### Control-plane + streaming: `examples/checkpointed.rs`
 ```bash
-cargo run --example checkpointed --features examples
+cargo run --example checkpointed
 ```
 
 ### Bounded replay: `examples/bounded_replay.rs`
 ```bash
-cargo run --example bounded_replay --features examples
+cargo run --example bounded_replay
 ```
 ### With TLS enabled: `examples/with_tls.rs`
 ```bash
@@ -236,7 +253,7 @@ PGSLOT=example_slot_tls \
 PGPUBLICATION=example_pub_tls \
 PGTLS_CA=/path/to/ca.pem \
 PGTLS_SNI=db.example.com \
-cargo run --example tls --features examples
+cargo run --example with_tls
 ```
 
 ### Enabling mTLS : `examples/with_mtls.rs`
@@ -257,7 +274,7 @@ PGTLS_CA=/etc/ssl/ca.pem \
 PGTLS_CLIENT_CERT=/etc/ssl/client.crt.pem \
 PGTLS_CLIENT_KEY=/etc/ssl/client.key.pem \
 PGTLS_SNI=db.example.com \
-cargo run --example mtls --features examples
+cargo run --example with_mtls
 ```
 - `PGUSER/PGPASSWORD` are used for control-plane setup (publication/slot).
 - `REPL_USER/REPL_PASSWORD` are used for the replication stream.
