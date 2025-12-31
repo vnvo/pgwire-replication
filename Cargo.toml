@@ -75,7 +75,9 @@ tracing-subscriber = { version = "0.3", optional = true, features = [
 [dev-dependencies]
 hex = "0.4"
 proptest = "1"
+tempfile = "3"
 tokio-postgres = "0.7"
+
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

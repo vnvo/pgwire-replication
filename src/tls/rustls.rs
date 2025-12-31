@@ -1,6 +1,50 @@
+//! TLS support using rustls.
+//!
+//! This module provides TLS/SSL connection upgrade for PostgreSQL connections
+//! using the rustls library. It supports:
+//!
+//! - All PostgreSQL SSL modes (disable, prefer, require, verify-ca, verify-full)
+//! - Custom CA certificates
+//! - Client certificate authentication (mTLS)
+//! - SNI hostname override
+//!
+//! # SSL Modes
+//!
+//! | Mode | Chain Verified | Hostname Verified | Falls back to plain |
+//! |------|----------------|-------------------|---------------------|
+//! | `Disable` | - | - | N/A (never uses TLS) |
+//! | `Prefer` | No | No | Yes |
+//! | `Require` | No | No | No |
+//! | `VerifyCa` | Yes | No | No |
+//! | `VerifyFull` | Yes | Yes | No |
+//!
+//! # Security Considerations
+//!
+//! - `Prefer` and `Require` modes are vulnerable to MITM attacks
+//! - `VerifyCa` protects against MITM but allows any hostname
+//! - `VerifyFull` provides full protection (recommended for production)
+//!
+//! # Example
+//!
+//! ```ignore
+//! use pgwire_replication::tls::rustls::maybe_upgrade_to_tls;
+//! use pgwire_replication::config::{SslMode, TlsConfig};
+//!
+//! let tls_config = TlsConfig {
+//!     mode: SslMode::VerifyFull,
+//!     ca_pem_path: Some("/path/to/ca.pem".into()),
+//!     ..Default::default()
+//! };
+//!
+//! let stream = maybe_upgrade_to_tls(tcp_stream, &tls_config, "db.example.com").await?;
+//! ```
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::{fs::File, io::BufReader, sync::Arc};
 
 use rustls::{ClientConfig, RootCertStore};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsConnector, client::TlsStream};
 
@@ -8,11 +52,102 @@ use crate::config::{SslMode, TlsConfig};
 use crate::error::{PgWireError, Result};
 use crate::protocol::framing::write_ssl_request;
 
+/// A stream that may or may not be TLS-encrypted.
+///
+/// This enum allows code to work with both plain TCP and TLS connections
+/// through a unified interface via `AsyncRead` and `AsyncWrite` implementations.
+#[derive(Debug)]
 pub enum MaybeTlsStream {
+    /// Unencrypted TCP connection
     Plain(TcpStream),
+    /// TLS-encrypted connection (boxed to reduce enum size)
     Tls(Box<TlsStream<TcpStream>>),
 }
 
+impl MaybeTlsStream {
+    /// Returns `true` if this is a TLS-encrypted stream.
+    #[inline]
+    pub fn is_tls(&self) -> bool {
+        matches!(self, MaybeTlsStream::Tls(_))
+    }
+
+    /// Returns `true` if this is a plain (unencrypted) stream.
+    #[inline]
+    pub fn is_plain(&self) -> bool {
+        matches!(self, MaybeTlsStream::Plain(_))
+    }
+
+    /// Returns a reference to the underlying `TcpStream`.
+    ///
+    /// For TLS streams, this returns the inner TCP stream.
+    pub fn get_ref(&self) -> &TcpStream {
+        match self {
+            MaybeTlsStream::Plain(s) => s,
+            MaybeTlsStream::Tls(s) => s.get_ref().0,
+        }
+    }
+}
+
+impl AsyncRead for MaybeTlsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_read(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for MaybeTlsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_write(cx, buf),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_flush(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            MaybeTlsStream::Plain(s) => Pin::new(s).poll_shutdown(cx),
+            MaybeTlsStream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+        }
+    }
+}
+
+/// Attempt to upgrade a TCP connection to TLS based on configuration.
+///
+/// This function implements PostgreSQL's SSL negotiation protocol:
+/// 1. Send SSLRequest message
+/// 2. Read single-byte response ('S' = proceed, 'N' = rejected)
+/// 3. If proceeding, perform TLS handshake
+///
+/// # Arguments
+/// * `tcp` - The TCP connection to potentially upgrade
+/// * `tls` - TLS configuration specifying mode and certificates
+/// * `host` - Target hostname (used for SNI and verification)
+///
+/// # Returns
+/// A `MaybeTlsStream` that is either the original TCP stream or a TLS-wrapped stream.
+///
+/// # Errors
+/// - Server rejects TLS when mode requires it
+/// - TLS handshake failure
+/// - Certificate verification failure (for VerifyCa/VerifyFull)
+/// - Invalid certificate/key files
 pub async fn maybe_upgrade_to_tls(
     mut tcp: TcpStream,
     tls: &TlsConfig,
@@ -23,8 +158,9 @@ pub async fn maybe_upgrade_to_tls(
         SslMode::Prefer | SslMode::Require | SslMode::VerifyCa | SslMode::VerifyFull => {}
     }
 
-    // pgwire TLS negotiation
+    // PostgreSQL TLS negotiation: send SSLRequest, expect 'S' or 'N'
     write_ssl_request(&mut tcp).await?;
+
     let mut resp = [0u8; 1];
     use tokio::io::AsyncReadExt;
     tcp.read_exact(&mut resp).await?;
@@ -39,16 +175,14 @@ pub async fn maybe_upgrade_to_tls(
         };
     }
 
-    // Verification semantics:
-    // - VerifyFull: verify chain + hostname
-    // - VerifyCa: verify chain, ignore hostname mismatch
-    // - Prefer/Require: do not verify (dangerous)
+    // Determine verification requirements based on SSL mode
     let verify_chain = matches!(tls.mode, SslMode::VerifyCa | SslMode::VerifyFull);
     let verify_hostname = matches!(tls.mode, SslMode::VerifyFull);
 
     let cfg = build_rustls_config(tls, verify_chain, verify_hostname, host)?;
     let connector = TlsConnector::from(Arc::new(cfg));
 
+    // SNI hostname: use override if provided, otherwise use connection host
     let sni = tls.sni_hostname.as_deref().unwrap_or(host);
     let server_name = rustls::pki_types::ServerName::try_from(sni.to_string())
         .map_err(|_| PgWireError::Tls(format!("invalid SNI hostname '{sni}'")))?;
@@ -56,79 +190,45 @@ pub async fn maybe_upgrade_to_tls(
     let tls_stream = connector
         .connect(server_name, tcp)
         .await
-        .map_err(|e| PgWireError::Tls(format!("tls handshake failed: {e}")))?;
+        .map_err(|e| PgWireError::Tls(format!("TLS handshake failed: {e}")))?;
 
     Ok(MaybeTlsStream::Tls(Box::new(tls_stream)))
 }
 
+/// Build rustls ClientConfig based on TLS settings.
 fn build_rustls_config(
     tls: &TlsConfig,
     verify_chain: bool,
     verify_hostname: bool,
     host: &str,
 ) -> Result<ClientConfig> {
-    use rustls::pki_types::CertificateDer;
-
     // ---- mTLS config validation ----
     let has_cert = tls.client_cert_pem_path.is_some();
     let has_key = tls.client_key_pem_path.is_some();
     if has_cert ^ has_key {
         return Err(PgWireError::Tls(format!(
-            "TLS config error: mTLS requires both client_cert_pem_path and client_key_pem_path (got cert={has_cert} key={has_key})"
+            "TLS config error: mTLS requires both client_cert_pem_path and client_key_pem_path \
+             (got cert={has_cert} key={has_key})"
         )));
     }
 
-    // Operator hint: VerifyFull + IP literal host is a common failure mode.
+    // Operator hint: VerifyFull + IP literal is a common misconfiguration
     if verify_hostname && host.parse::<std::net::IpAddr>().is_ok() && tls.sni_hostname.is_none() {
         return Err(PgWireError::Tls(format!(
             "TLS config error: VerifyFull enabled but host '{host}' is an IP address. \
-             Hint: use a DNS name matching the certificate, or set tls.sni_hostname to that DNS name, or use VerifyCa."
+             Hint: use a DNS name matching the certificate, or set tls.sni_hostname, \
+             or use VerifyCa mode."
         )));
     }
 
-    // ---- Root store (CA) ----
-    let mut roots = RootCertStore::empty();
-
-    if let Some(path) = &tls.ca_pem_path {
-        let f = File::open(path).map_err(|e| {
-            PgWireError::Tls(format!(
-                "TLS config error: failed to open CA PEM {}: {e}",
-                path.display()
-            ))
-        })?;
-        let mut rd = BufReader::new(f);
-
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                PgWireError::Tls(format!(
-                    "TLS config error: failed to parse CA PEM {}: {e}",
-                    path.display()
-                ))
-            })?
-            .into_iter()
-            .map(|c| c.into_owned())
-            .collect();
-
-        let (added, _ignored) = roots.add_parsable_certificates(certs);
-        if added == 0 {
-            return Err(PgWireError::Tls(format!(
-                "TLS config error: no valid CA certificates found in {}",
-                path.display()
-            )));
-        }
-    } else {
-        // Mozilla roots (webpki-roots)
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    }
-
-    // rustls verifier builder needs Arc<RootCertStore>
+    // ---- Root certificate store ----
+    let roots = build_root_store(tls)?;
     let roots_arc = Arc::new(roots.clone());
 
     // ---- Base config builder ----
     let builder = ClientConfig::builder().with_root_certificates(roots);
 
-    // ---- Client auth (mTLS) ----
+    // ---- Client authentication (mTLS) ----
     let mut cfg: ClientConfig = if has_cert {
         let cert_path = tls.client_cert_pem_path.as_ref().unwrap();
         let key_path = tls.client_key_pem_path.as_ref().unwrap();
@@ -145,32 +245,72 @@ fn build_rustls_config(
         builder.with_no_client_auth()
     };
 
-    // ---- Verification policy ----
+    // ---- Custom verification policy ----
     if !verify_chain {
-        // Prefer/Require: no verification
-        let effective_host = tls.sni_hostname.as_deref().unwrap_or(host).to_string();
+        // Prefer/Require: skip all verification (dangerous but matches PostgreSQL behavior)
         cfg.dangerous()
-            .set_certificate_verifier(Arc::new(NoVerifyAll {
-                verify_hostname,
-                host: effective_host,
-            }));
+            .set_certificate_verifier(Arc::new(NoVerifier));
         return Ok(cfg);
     }
 
     if verify_chain && !verify_hostname {
-        // VerifyCa: verify chain but ignore hostname mismatch
+        // VerifyCa: verify certificate chain but ignore hostname mismatch
         let inner = rustls::client::WebPkiServerVerifier::builder(roots_arc)
             .build()
             .map_err(|e| PgWireError::Tls(format!("TLS config error: build verifier: {e}")))?;
 
         cfg.dangerous()
-            .set_certificate_verifier(Arc::new(VerifyChainNoHostname { inner }));
+            .set_certificate_verifier(Arc::new(VerifyChainOnly { inner }));
     }
 
-    // VerifyFull: rustls default verifier already verifies chain + hostname.
+    // VerifyFull: rustls default behavior already verifies chain + hostname
     Ok(cfg)
 }
 
+/// Build root certificate store from config or system defaults.
+fn build_root_store(tls: &TlsConfig) -> Result<RootCertStore> {
+    use rustls::pki_types::CertificateDer;
+
+    let mut roots = RootCertStore::empty();
+
+    if let Some(path) = &tls.ca_pem_path {
+        // Load custom CA certificates
+        let f = File::open(path).map_err(|e| {
+            PgWireError::Tls(format!(
+                "TLS config error: failed to open CA PEM '{}': {e}",
+                path.display()
+            ))
+        })?;
+        let mut rd = BufReader::new(f);
+
+        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                PgWireError::Tls(format!(
+                    "TLS config error: failed to parse CA PEM '{}': {e}",
+                    path.display()
+                ))
+            })?
+            .into_iter()
+            .map(|c| c.into_owned())
+            .collect();
+
+        let (added, _ignored) = roots.add_parsable_certificates(certs);
+        if added == 0 {
+            return Err(PgWireError::Tls(format!(
+                "TLS config error: no valid CA certificates found in '{}'",
+                path.display()
+            )));
+        }
+    } else {
+        // Use Mozilla's root certificates (webpki-roots)
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    Ok(roots)
+}
+
+/// Load certificate chain from PEM file.
 fn load_cert_chain(
     path: &std::path::Path,
 ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
@@ -178,7 +318,7 @@ fn load_cert_chain(
 
     let f = File::open(path).map_err(|e| {
         PgWireError::Tls(format!(
-            "TLS config error: failed to open client certificate PEM {}: {e}",
+            "TLS config error: failed to open client certificate '{}': {e}",
             path.display()
         ))
     })?;
@@ -188,7 +328,7 @@ fn load_cert_chain(
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| {
             PgWireError::Tls(format!(
-                "TLS config error: failed to parse client certificate PEM {}: {e}",
+                "TLS config error: failed to parse client certificate '{}': {e}",
                 path.display()
             ))
         })?
@@ -198,7 +338,7 @@ fn load_cert_chain(
 
     if certs.is_empty() {
         return Err(PgWireError::Tls(format!(
-            "TLS config error: no certificates found in client certificate PEM {}",
+            "TLS config error: no certificates found in '{}'",
             path.display()
         )));
     }
@@ -206,103 +346,136 @@ fn load_cert_chain(
     Ok(certs)
 }
 
+/// Load private key from PEM file.
+///
+/// Supports PKCS#8, PKCS#1 (RSA), and SEC1 (EC) key formats.
 fn load_private_key(path: &std::path::Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    // Try PKCS#8 first (most common modern format)
+    if let Some(key) = try_load_pkcs8_key(path)? {
+        return Ok(key);
+    }
+
+    // Try RSA PKCS#1 format
+    if let Some(key) = try_load_rsa_key(path)? {
+        return Ok(key);
+    }
+
+    // Try EC SEC1 format
+    if let Some(key) = try_load_ec_key(path)? {
+        return Ok(key);
+    }
+
+    Err(PgWireError::Tls(format!(
+        "TLS config error: no private key found in '{}'. \
+         Supported formats: PKCS#8, PKCS#1 (RSA), SEC1 (EC)",
+        path.display()
+    )))
+}
+
+fn try_load_pkcs8_key(
+    path: &std::path::Path,
+) -> Result<Option<rustls::pki_types::PrivateKeyDer<'static>>> {
     use rustls::pki_types::PrivateKeyDer;
 
-    // Try PKCS#8 first
     let f = File::open(path).map_err(|e| {
         PgWireError::Tls(format!(
-            "TLS config error: failed to open private key PEM {}: {e}",
+            "TLS config error: failed to open private key '{}': {e}",
             path.display()
         ))
     })?;
     let mut rd = BufReader::new(f);
 
-    let mut keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::pkcs8_private_keys(&mut rd)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            PgWireError::Tls(format!(
-                "TLS config error: failed to parse PKCS#8 private key PEM {}: {e}",
-                path.display()
-            ))
-        })?
-        .into_iter()
+    let keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::pkcs8_private_keys(&mut rd)
+        .filter_map(|r| r.ok())
         .map(PrivateKeyDer::from)
         .collect();
 
-    if keys.is_empty() {
-        // Re-open and try RSA (PKCS#1)
-        let f = File::open(path).map_err(|e| {
-            PgWireError::Tls(format!(
-                "TLS config error: failed to re-open private key PEM {}: {e}",
-                path.display()
-            ))
-        })?;
-        let mut rd = BufReader::new(f);
-
-        keys = rustls_pemfile::rsa_private_keys(&mut rd)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                PgWireError::Tls(format!(
-                    "TLS config error: failed to parse RSA private key PEM {}: {e}",
-                    path.display()
-                ))
-            })?
-            .into_iter()
-            .map(PrivateKeyDer::from)
-            .collect();
-    }
-
-    if keys.is_empty() {
-        return Err(PgWireError::Tls(format!(
-            "TLS config error: no private keys found in {} (expected PKCS#8 or RSA). \
-             Hint: provide a PEM-encoded PKCS#8 private key for best compatibility.",
+    match keys.len() {
+        0 => Ok(None),
+        1 => Ok(Some(keys.into_iter().next().unwrap())),
+        n => Err(PgWireError::Tls(format!(
+            "TLS config error: found {n} PKCS#8 keys in '{}', expected 1",
             path.display()
-        )));
+        ))),
     }
-    if keys.len() > 1 {
-        return Err(PgWireError::Tls(format!(
-            "TLS config error: multiple private keys found in {}. Please provide exactly one.",
-            path.display()
-        )));
-    }
-
-    Ok(keys.remove(0))
 }
 
-// ---------------- Verifiers ----------------
+fn try_load_rsa_key(
+    path: &std::path::Path,
+) -> Result<Option<rustls::pki_types::PrivateKeyDer<'static>>> {
+    use rustls::pki_types::PrivateKeyDer;
 
+    let f = File::open(path).map_err(|e| {
+        PgWireError::Tls(format!(
+            "TLS config error: failed to open private key '{}': {e}",
+            path.display()
+        ))
+    })?;
+    let mut rd = BufReader::new(f);
+
+    let keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::rsa_private_keys(&mut rd)
+        .filter_map(|r| r.ok())
+        .map(PrivateKeyDer::from)
+        .collect();
+
+    match keys.len() {
+        0 => Ok(None),
+        1 => Ok(Some(keys.into_iter().next().unwrap())),
+        n => Err(PgWireError::Tls(format!(
+            "TLS config error: found {n} RSA keys in '{}', expected 1",
+            path.display()
+        ))),
+    }
+}
+
+fn try_load_ec_key(
+    path: &std::path::Path,
+) -> Result<Option<rustls::pki_types::PrivateKeyDer<'static>>> {
+    use rustls::pki_types::PrivateKeyDer;
+
+    let f = File::open(path).map_err(|e| {
+        PgWireError::Tls(format!(
+            "TLS config error: failed to open private key '{}': {e}",
+            path.display()
+        ))
+    })?;
+    let mut rd = BufReader::new(f);
+
+    let keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::ec_private_keys(&mut rd)
+        .filter_map(|r| r.ok())
+        .map(PrivateKeyDer::from)
+        .collect();
+
+    match keys.len() {
+        0 => Ok(None),
+        1 => Ok(Some(keys.into_iter().next().unwrap())),
+        n => Err(PgWireError::Tls(format!(
+            "TLS config error: found {n} EC keys in '{}', expected 1",
+            path.display()
+        ))),
+    }
+}
+
+// ==================== Custom Certificate Verifiers ====================
+
+/// Verifier that accepts any certificate without verification.
+///
+/// Used for `SslMode::Prefer` and `SslMode::Require`.
+///
+/// # Security Warning
+/// This provides NO protection against man-in-the-middle attacks.
 #[derive(Debug)]
-struct NoVerifyAll {
-    verify_hostname: bool,
-    host: String,
-}
+struct NoVerifier;
 
-impl rustls::client::danger::ServerCertVerifier for NoVerifyAll {
+impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     fn verify_server_cert(
         &self,
         _end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        if self.verify_hostname {
-            match server_name {
-                rustls::pki_types::ServerName::DnsName(dns) => {
-                    if dns.as_ref() != self.host.as_str() {
-                        return Err(rustls::Error::InvalidCertificate(
-                            rustls::CertificateError::NotValidForName,
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(rustls::Error::InvalidCertificate(
-                        rustls::CertificateError::NotValidForName,
-                    ));
-                }
-            }
-        }
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -325,20 +498,31 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifyAll {
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        // Support all common signature schemes
         vec![
             rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
+            rustls::SignatureScheme::ED25519,
             rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::RSA_PKCS1_SHA384,
+            rustls::SignatureScheme::RSA_PKCS1_SHA512,
             rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
         ]
     }
 }
 
+/// Verifier that validates the certificate chain but ignores hostname mismatch.
+///
+/// Used for `SslMode::VerifyCa`.
 #[derive(Debug)]
-struct VerifyChainNoHostname {
+struct VerifyChainOnly {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
 }
 
-impl rustls::client::danger::ServerCertVerifier for VerifyChainNoHostname {
+impl rustls::client::danger::ServerCertVerifier for VerifyChainOnly {
     fn verify_server_cert(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
@@ -352,8 +536,8 @@ impl rustls::client::danger::ServerCertVerifier for VerifyChainNoHostname {
             .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)
         {
             Ok(ok) => Ok(ok),
+            // VerifyCa: ignore hostname mismatch but enforce chain validation
             Err(rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName)) => {
-                // VerifyCa: ignore hostname mismatch, keep chain validation.
                 Ok(rustls::client::danger::ServerCertVerified::assertion())
             }
             Err(e) => Err(e),
@@ -380,5 +564,104 @@ impl rustls::client::danger::ServerCertVerifier for VerifyChainNoHostname {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.inner.supported_verify_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    // ==================== mTLS misconfiguration detection ====================
+    // These catch a common mistake: providing cert without key or vice versa
+
+    #[test]
+    fn mtls_requires_both_cert_and_key() {
+        // Cert without key
+        let tls = TlsConfig {
+            client_cert_pem_path: Some("/path/to/cert.pem".into()),
+            client_key_pem_path: None,
+            ..Default::default()
+        };
+        let err = build_rustls_config(&tls, false, false, "localhost").unwrap_err();
+        assert!(err.to_string().contains("mTLS requires both"));
+
+        // Key without cert
+        let tls = TlsConfig {
+            client_cert_pem_path: None,
+            client_key_pem_path: Some("/path/to/key.pem".into()),
+            ..Default::default()
+        };
+        let err = build_rustls_config(&tls, false, false, "localhost").unwrap_err();
+        assert!(err.to_string().contains("mTLS requires both"));
+    }
+
+    // ==================== VerifyFull + IP address detection ====================
+    // Catches a common mistake: VerifyFull requires hostname, not IP
+
+    #[test]
+    fn verify_full_rejects_ip_without_sni_override() {
+        let tls = TlsConfig {
+            mode: SslMode::VerifyFull,
+            ..Default::default()
+        };
+
+        // Should fail: IP address can't match certificate hostname
+        let err = build_rustls_config(&tls, true, true, "192.168.1.1").unwrap_err();
+        assert!(err.to_string().contains("IP address"));
+
+        // Should succeed: SNI override provides hostname for verification
+        let tls_with_sni = TlsConfig {
+            mode: SslMode::VerifyFull,
+            sni_hostname: Some("db.example.com".into()),
+            ..Default::default()
+        };
+        assert!(build_rustls_config(&tls_with_sni, true, true, "192.168.1.1").is_ok());
+    }
+
+    // ==================== File error handling ====================
+    // Ensures clear error messages for common file issues
+
+    #[test]
+    fn missing_ca_file_gives_clear_error() {
+        let tls = TlsConfig {
+            ca_pem_path: Some("/nonexistent/ca.pem".into()),
+            ..Default::default()
+        };
+
+        let err = build_root_store(&tls).unwrap_err().to_string();
+        assert!(err.contains("failed to open"));
+        assert!(err.contains("ca.pem"));
+    }
+
+    #[test]
+    fn empty_ca_file_gives_clear_error() {
+        let f = NamedTempFile::new().unwrap();
+        let tls = TlsConfig {
+            ca_pem_path: Some(f.path().to_path_buf()),
+            ..Default::default()
+        };
+
+        let err = build_root_store(&tls).unwrap_err().to_string();
+        assert!(err.contains("no valid CA certificates"));
+    }
+
+    #[test]
+    fn empty_key_file_gives_clear_error() {
+        let f = NamedTempFile::new().unwrap();
+
+        let err = load_private_key(f.path()).unwrap_err().to_string();
+        assert!(err.contains("no private key"));
+    }
+
+    #[test]
+    fn invalid_pem_gives_clear_error() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"this is not a valid PEM file").unwrap();
+
+        // Should fail gracefully, not panic
+        assert!(load_private_key(f.path()).is_err());
+        assert!(load_cert_chain(f.path()).is_err());
     }
 }
