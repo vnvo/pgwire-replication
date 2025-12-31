@@ -1,10 +1,12 @@
-#[path = "_shared/common.rs"]
-mod common;
+// examples/bounded_replay.rs
+//
+// cargo run --example bounded_replay --features examples
 
+#[path = "support/common.rs"]
+mod common;
 use pgwire_replication::{
     Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
 };
-
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
@@ -18,7 +20,7 @@ async fn current_wal_lsn(sql: &tokio_postgres::Client) -> anyhow::Result<Lsn> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn main() -> anyhow::Result<()> {
     let host = env("PGHOST", "127.0.0.1");
     let port: u16 = env("PGPORT", "5432").parse()?;
     let user = env("PGUSER", "postgres");
@@ -36,11 +38,11 @@ async fn main() -> anyhow::Result<()> {
     println!("bounded replay start={start_lsn} stop_at={stop_at_lsn}");
 
     let cfg = ReplicationConfig {
-        host: host.into(),
+        host,
         port,
-        user: user.into(),
-        password: password.into(),
-        database: database.into(),
+        user,
+        password,
+        database,
         tls: TlsConfig {
             mode: SslMode::Disable,
             ca_pem_path: None,
@@ -49,8 +51,8 @@ async fn main() -> anyhow::Result<()> {
             client_key_pem_path: None,
         },
 
-        slot: slot.into(),
-        publication: publication.into(),
+        slot,
+        publication,
         start_lsn,
         stop_at_lsn: Some(stop_at_lsn),
 

@@ -183,6 +183,8 @@ async fn start_repl(
             mode: SslMode::Disable,
             ca_pem_path: None,
             sni_hostname: None,
+            client_cert_pem_path: None,
+            client_key_pem_path: None,
         },
         slot: "slot1".into(),
         publication: "pub1".into(),

@@ -1,4 +1,8 @@
-#[path = "_shared/common.rs"]
+// examples/with_tls.rs
+//
+// cargo run --example with_tls --features "examples,tls-rustls"
+
+#[path = "support/common.rs"]
 mod common;
 
 use pgwire_replication::{
@@ -11,7 +15,7 @@ fn env(name: &str, default: &str) -> String {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn main() -> anyhow::Result<()> {
     // Connection parameters
     let host = env("PGHOST", "localhost");
     let port: u16 = env("PGPORT", "5432").parse()?;
@@ -25,18 +29,18 @@ async fn main() -> anyhow::Result<()> {
     let ca_pem_path = PathBuf::from(env("PGTLS_CA", "/etc/ssl/certs/ca-certificates.crt"));
     let sni_hostname = env("PGTLS_SNI", &host);
 
-    // Control plane (still plain SQL via tokio-postgres; TLS there is optional and independent)
+    // Control plane (SQL)
     let sql = common::connect_control_plane(&host, port, &user, &password, &database).await?;
     let start_lsn = common::ensure_slot_and_get_start_lsn(&sql, &slot, &publication).await?;
 
     println!("starting TLS replication from start_lsn={start_lsn}");
 
     let cfg = ReplicationConfig {
-        host: host.into(),
+        host,
         port,
-        user: user.into(),
-        password: password.into(),
-        database: database.into(),
+        user,
+        password,
+        database,
 
         tls: TlsConfig {
             mode: SslMode::VerifyFull,
@@ -46,8 +50,8 @@ async fn main() -> anyhow::Result<()> {
             client_key_pem_path: None,
         },
 
-        slot: slot.into(),
-        publication: publication.into(),
+        slot,
+        publication,
         start_lsn,
         stop_at_lsn: None,
 

@@ -1,5 +1,3 @@
-#![cfg(feature = "tls-rustls")]
-
 use std::{fs::File, io::BufReader, sync::Arc};
 
 use rustls::{ClientConfig, RootCertStore};
@@ -12,7 +10,7 @@ use crate::protocol::framing::write_ssl_request;
 
 pub enum MaybeTlsStream {
     Plain(TcpStream),
-    Tls(TlsStream<TcpStream>),
+    Tls(Box<TlsStream<TcpStream>>),
 }
 
 pub async fn maybe_upgrade_to_tls(
@@ -60,7 +58,7 @@ pub async fn maybe_upgrade_to_tls(
         .await
         .map_err(|e| PgWireError::Tls(format!("tls handshake failed: {e}")))?;
 
-    Ok(MaybeTlsStream::Tls(tls_stream))
+    Ok(MaybeTlsStream::Tls(Box::new(tls_stream)))
 }
 
 fn build_rustls_config(
@@ -109,7 +107,7 @@ fn build_rustls_config(
                 ))
             })?
             .into_iter()
-            .map(|c| CertificateDer::from(c.into_owned()))
+            .map(|c| c.into_owned())
             .collect();
 
         let (added, _ignored) = roots.add_parsable_certificates(certs);
@@ -195,7 +193,7 @@ fn load_cert_chain(
             ))
         })?
         .into_iter()
-        .map(|c| CertificateDer::from(c.into_owned()))
+        .map(|c| c.into_owned())
         .collect();
 
     if certs.is_empty() {

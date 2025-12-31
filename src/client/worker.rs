@@ -151,24 +151,24 @@ impl WorkerState {
                             data,
                         } => {
                             // Optional stop condition: best-effort based on WAL end LSN
-                            if let Some(stop) = self.cfg.stop_at_lsn {
-                                if wal_end >= stop {
-                                    let _ = self
-                                        .out
-                                        .send(Ok(ReplicationEvent::XLogData {
-                                            wal_start,
-                                            wal_end,
-                                            server_time_micros,
-                                            data,
-                                        }))
-                                        .await;
-                                    let _ = self
-                                        .out
-                                        .send(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
-                                        .await;
-                                    let _ = crate::protocol::framing::write_copy_done(stream).await;
-                                    return Ok(());
-                                }
+                            if let Some(stop) = self.cfg.stop_at_lsn
+                                && wal_end >= stop
+                            {
+                                let _ = self
+                                    .out
+                                    .send(Ok(ReplicationEvent::XLogData {
+                                        wal_start,
+                                        wal_end,
+                                        server_time_micros,
+                                        data,
+                                    }))
+                                    .await;
+                                let _ = self
+                                    .out
+                                    .send(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
+                                    .await;
+                                let _ = crate::protocol::framing::write_copy_done(stream).await;
+                                return Ok(());
                             }
 
                             let _ = self
@@ -282,7 +282,7 @@ impl WorkerState {
             let mut init = Vec::new();
             init.extend_from_slice(b"SCRAM-SHA-256");
             init.push(0);
-            init.extend_from_slice(&(scram.client_first.as_bytes().len() as i32).to_be_bytes());
+            init.extend_from_slice(&(scram.client_first.len() as i32).to_be_bytes());
             init.extend_from_slice(scram.client_first.as_bytes());
             crate::protocol::framing::write_password_message(stream, &init).await?;
 

@@ -1,4 +1,8 @@
-#[path = "_shared/common.rs"]
+// examples/real/checkpointed.rs
+//
+// cargo run --example checkpointed
+
+#[path = "support/common.rs"]
 mod common;
 
 use pgwire_replication::{
@@ -25,11 +29,11 @@ async fn main() -> anyhow::Result<()> {
     println!("starting replication from start_lsn={start_lsn}");
 
     let cfg = ReplicationConfig {
-        host: host.into(),
+        host,
         port,
-        user: user.into(),
-        password: password.into(),
-        database: database.into(),
+        user,
+        password,
+        database,
         tls: TlsConfig {
             mode: SslMode::Disable,
             ca_pem_path: None,
@@ -37,12 +41,10 @@ async fn main() -> anyhow::Result<()> {
             client_cert_pem_path: None,
             client_key_pem_path: None,
         },
-
-        slot: slot.into(),
-        publication: publication.into(),
+        slot,
+        publication,
         start_lsn,
         stop_at_lsn: None,
-
         status_interval: std::time::Duration::from_secs(1),
         idle_timeout: std::time::Duration::from_secs(30),
         buffer_events: 8192,

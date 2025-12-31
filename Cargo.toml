@@ -32,7 +32,6 @@ tls-rustls = [
 scram = ["dep:base64", "dep:hmac", "dep:sha2", "dep:rand"]
 md5 = ["dep:md5"]
 pgoutput = []
-examples = ["dep:tokio-postgres"]
 integration-tests = [
     "dep:testcontainers",
     "dep:tokio-postgres",
@@ -76,3 +75,15 @@ tracing-subscriber = { version = "0.3", optional = true, features = [
 [dev-dependencies]
 hex = "0.4"
 proptest = "1"
+tokio-postgres = "0.7"
+
+
+[[example]]
+name = "with_tls"
+path = "examples/with_tls.rs"
+required-features = ["tls-rustls"]
+
+[[example]]
+name = "with_mtls"
+path = "examples/with_mtls.rs"
+required-features = ["tls-rustls"]

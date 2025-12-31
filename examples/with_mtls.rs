@@ -1,6 +1,9 @@
-#[path = "_shared/common.rs"]
-mod common;
+// examples/with_mtls.rs
+//
+// cargo run --example with_mtls --features "examples,tls-rustls"
 
+#[path = "support/common.rs"]
+mod common;
 use pgwire_replication::{
     ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
 };
@@ -15,7 +18,7 @@ fn env_opt(name: &str) -> Option<String> {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn main() -> anyhow::Result<()> {
     // ---- Connection parameters ----
     let host = env("PGHOST", "db.example.com");
     let port: u16 = env("PGPORT", "5432").parse()?;
@@ -26,7 +29,6 @@ async fn main() -> anyhow::Result<()> {
     let pg_database = env("PGDATABASE", "postgres");
 
     // Replication-plane identity (logical replication)
-    // If not provided, fall back to control-plane identity.
     let repl_user = env_opt("REPL_USER").unwrap_or_else(|| pg_user.clone());
     let repl_password = env_opt("REPL_PASSWORD").unwrap_or_else(|| pg_password.clone());
 
@@ -40,10 +42,8 @@ async fn main() -> anyhow::Result<()> {
     let sni = env("PGTLS_SNI", &host);
 
     // ---- Control plane (SQL) ----
-    // Uses PGUSER/PGPASSWORD, not replication credentials.
     let sql =
         common::connect_control_plane(&host, port, &pg_user, &pg_password, &pg_database).await?;
-
     let start_lsn = common::ensure_slot_and_get_start_lsn(&sql, &slot, &publication).await?;
 
     println!(
@@ -52,11 +52,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- Replication config ----
     let cfg = ReplicationConfig {
-        host: host.into(),
+        host,
         port,
-        user: repl_user.into(),
-        password: repl_password.into(),
-        database: pg_database.into(),
+        user: repl_user,
+        password: repl_password,
+        database: pg_database,
 
         tls: TlsConfig {
             mode: SslMode::VerifyFull,
@@ -66,8 +66,8 @@ async fn main() -> anyhow::Result<()> {
             client_key_pem_path: Some(client_key),
         },
 
-        slot: slot.into(),
-        publication: publication.into(),
+        slot,
+        publication,
         start_lsn,
         stop_at_lsn: None,
 

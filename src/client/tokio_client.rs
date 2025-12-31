@@ -1,10 +1,9 @@
-use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
-use tokio::task::JoinHandle;
-
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
+use tokio::net::TcpStream;
+use tokio::sync::{mpsc, watch};
+use tokio::task::JoinHandle;
 
 #[cfg(not(feature = "tls-rustls"))]
 use crate::config::SslMode;
@@ -15,7 +14,7 @@ pub struct ReplicationClient {
     rx: ReplicationEventReceiver,
     applied_tx: watch::Sender<Lsn>,
     stop_tx: watch::Sender<bool>,
-    join: JoinHandle<()>,
+    join: Option<JoinHandle<std::result::Result<(), PgWireError>>>,
 }
 
 impl ReplicationClient {
@@ -27,16 +26,17 @@ impl ReplicationClient {
         let join = tokio::spawn(async move {
             let mut worker = WorkerState::new(cfg.clone(), applied_rx, stop_rx, tx);
             let res = run_worker(&mut worker, &cfg).await;
-            if let Err(e) = res {
+            if let Err(ref e) = res {
                 tracing::error!("replication worker terminated with error: {e}");
             }
+            res
         });
 
         Ok(Self {
             rx,
             applied_tx,
             stop_tx,
-            join,
+            join: Some(join),
         })
     }
 
@@ -45,9 +45,24 @@ impl ReplicationClient {
         match self.rx.recv().await {
             Some(Ok(ev)) => Ok(ev),
             Some(Err(e)) => Err(e),
-            None => Err(PgWireError::Task(
-                "replication worker channel closed".into(),
-            )),
+            None => {
+                // worker is gone; await join to find out why
+                let join = self.join.take().ok_or_else(|| {
+                    PgWireError::Internal(
+                        "replication worker channel closed (join already consumed)".into(),
+                    )
+                })?;
+
+                match join.await {
+                    Ok(Ok(())) => Err(PgWireError::Internal(
+                        "replication worker exited unexpectedly".into(),
+                    )),
+                    Ok(Err(e)) => Err(e),
+                    Err(join_err) => Err(PgWireError::Task(format!(
+                        "replication worker panicked: {join_err}"
+                    ))),
+                }
+            }
         }
     }
 
@@ -63,11 +78,15 @@ impl ReplicationClient {
     }
 
     /// Join the worker task (useful for diagnostics).
-    pub async fn join(self) -> std::result::Result<(), PgWireError> {
-        self.join
-            .await
-            .map_err(|e| PgWireError::Task(format!("join error: {e}")))?;
-        Ok(())
+    pub async fn join(mut self) -> std::result::Result<(), PgWireError> {
+        let join = self
+            .join
+            .take()
+            .ok_or_else(|| PgWireError::Task("join already consumed".into()))?;
+        match join.await {
+            Ok(inner) => inner,
+            Err(e) => Err(PgWireError::Task(format!("join error: {e}"))),
+        }
     }
 }
 
@@ -82,7 +101,7 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
         let upgraded = maybe_upgrade_to_tls(tcp, &cfg.tls, &cfg.host).await?;
         match upgraded {
             MaybeTlsStream::Plain(mut s) => worker.run_on_stream(&mut s).await,
-            MaybeTlsStream::Tls(mut s) => worker.run_on_stream(&mut s).await,
+            MaybeTlsStream::Tls(mut s) => worker.run_on_stream(s.as_mut()).await,
         }
     }
 

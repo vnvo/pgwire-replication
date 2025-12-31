@@ -1,4 +1,7 @@
-/// START_LSN="0/16B6C50" cargo run --example basic
+// examples/basic.rs
+//
+// START_LSN="0/16B6C50" cargo run --example basic --features examples
+
 use pgwire_replication::{
     Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
 };
@@ -8,7 +11,7 @@ fn env(name: &str, default: &str) -> String {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn main() -> anyhow::Result<()> {
     let host = env("PGHOST", "127.0.0.1");
     let port: u16 = env("PGPORT", "5432").parse()?;
     let user = env("PGUSER", "postgres");
@@ -21,11 +24,11 @@ async fn main() -> anyhow::Result<()> {
     let start_lsn = Lsn::parse(&env("START_LSN", "0/0")).unwrap();
 
     let cfg = ReplicationConfig {
-        host: host.into(),
+        host,
         port,
-        user: user.into(),
-        password: password.into(),
-        database: database.into(),
+        user,
+        password,
+        database,
         tls: TlsConfig {
             mode: SslMode::Disable,
             ca_pem_path: None,
@@ -34,8 +37,8 @@ async fn main() -> anyhow::Result<()> {
             client_key_pem_path: None,
         },
 
-        slot: slot.into(),
-        publication: publication.into(),
+        slot,
+        publication,
         start_lsn,
         stop_at_lsn: None,
 

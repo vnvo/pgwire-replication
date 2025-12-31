@@ -1,7 +1,12 @@
+// examples/control_and_stream.rs
+//
+// cargo run --example control_and_stream --features examples
+
 use anyhow::Context;
 use pgwire_replication::{
     Lsn, ReplicationClient, ReplicationConfig, SslMode, TlsConfig, client::ReplicationEvent,
 };
+
 use tokio_postgres::NoTls;
 
 /// Control-plane helper:
@@ -16,7 +21,6 @@ async fn control_plane_get_start_lsn(
     slot: &str,
     publication: &str,
 ) -> anyhow::Result<Lsn> {
-    // Control plane: use a normal Postgres client.
     let dsn = format!("host={host} port={port} user={user} password={password} dbname={database}");
     let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
         .await
@@ -25,31 +29,22 @@ async fn control_plane_get_start_lsn(
         let _ = conn.await;
     });
 
-    // Minimal setup example. In real systems you will likely do:
-    // - CREATE TABLE ...
-    // - CREATE PUBLICATION ...
-    // - SELECT pg_create_logical_replication_slot(...) ...
     client
         .batch_execute(&format!("CREATE PUBLICATION {publication} FOR ALL TABLES;"))
         .await
-        .ok(); // ignore if already exists or you manage pubs elsewhere
+        .ok();
 
-    // Ensure the slot exists (idempotent-ish).
-    // If the slot already exists, this will error, so we try then ignore.
     let _ = client
         .batch_execute(&format!(
             "SELECT * FROM pg_create_logical_replication_slot('{slot}','pgoutput');"
         ))
         .await;
 
-    // Preferred start point: slot confirmed_flush_lsn (resume point).
-    // Fallback: restart_lsn (can cause re-delivery depending on consumer semantics).
-    // Last resort: current WAL (starts “now”, may skip earlier changes).
     let row = client
         .query_opt(
             "SELECT confirmed_flush_lsn::text, restart_lsn::text
-             FROM pg_replication_slots
-             WHERE slot_name = $1",
+                FROM pg_replication_slots
+                WHERE slot_name = $1",
             &[&slot],
         )
         .await
@@ -75,7 +70,7 @@ async fn control_plane_get_start_lsn(
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+pub async fn main() -> anyhow::Result<()> {
     let host = "127.0.0.1";
     let port = 5432;
     let user = "postgres";
@@ -120,10 +115,7 @@ async fn main() -> anyhow::Result<()> {
         let ev = repl.recv().await?;
         match ev {
             ReplicationEvent::XLogData { wal_end, data, .. } => {
-                // Process pgoutput payload (bytes)
                 println!("XLogData wal_end={wal_end} bytes={}", data.len());
-
-                // Report progress so WAL can be released and feedback remains correct
                 repl.update_applied_lsn(wal_end);
             }
             ReplicationEvent::KeepAlive {

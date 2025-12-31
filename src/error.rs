@@ -19,6 +19,9 @@ pub enum PgWireError {
 
     #[error("task ended unexpectedly: {0}")]
     Task(String),
+
+    #[error("internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, PgWireError>;
