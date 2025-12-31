@@ -54,7 +54,7 @@ anyhow = "1"
 tracing = "0.1"
 
 # Optional TLS
-rustls = { version = "0.23", optional = true }
+rustls = { version = "0.23", features = ["ring"], optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 webpki-roots = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }

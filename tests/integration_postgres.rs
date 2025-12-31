@@ -46,7 +46,7 @@ fn get_available_port() -> u16 {
 
 fn postgres_image(host_port: u16) -> ContainerRequest<GenericImage> {
     GenericImage::new("postgres", "16-alpine")
-        .with_wait_for(WaitFor::message_on_stdout(
+        .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
         ))
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -691,5 +691,652 @@ async fn postgres_replication_multi_table() -> Result<()> {
     let _ = repl.join().await;
 
     info!("multi-table test completed successfully");
+    Ok(())
+}
+
+// ============================================================================
+// SCRAM-SHA-256 Authentication Test
+// ============================================================================
+
+/// Test SCRAM-SHA-256 authentication (the default in PostgreSQL 14+).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "scram")]
+async fn postgres_replication_scram_auth() -> Result<()> {
+    init_tracing();
+    let host_port = get_available_port();
+
+    // Create pg_hba.conf that requires scram-sha-256
+    let hba_content = r#"
+# TYPE  DATABASE        USER            ADDRESS                 METHOD
+local   all             all                                     scram-sha-256
+host    all             all             0.0.0.0/0               scram-sha-256
+host    all             all             ::/0                    scram-sha-256
+host    replication     all             0.0.0.0/0               scram-sha-256
+host    replication     all             ::/0                    scram-sha-256
+"#;
+
+    let temp_dir = tempfile::tempdir()?;
+    let hba_path = temp_dir.path().join("pg_hba.conf");
+    std::fs::write(&hba_path, hba_content)?;
+
+    info!("starting postgres container with SCRAM auth on port {host_port}");
+
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_wait_for(WaitFor::message_on_stderr(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "scram_test_password")
+        .with_env_var("POSTGRES_USER", "scram_user")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "scram-sha-256")
+        .with_env_var(
+            "POSTGRES_INITDB_ARGS",
+            "--auth-host=scram-sha-256 --auth-local=scram-sha-256",
+        )
+        .with_cmd([
+            "postgres",
+            "-c",
+            "wal_level=logical",
+            "-c",
+            "max_replication_slots=10",
+            "-c",
+            "max_wal_senders=10",
+            "-c",
+            "password_encryption=scram-sha-256",
+        ])
+        .with_mapped_port(host_port, 5432.tcp());
+
+    let container = image.start().await.expect("start postgres with SCRAM");
+    follow_container_logs(&container).await;
+
+    // Connect with tokio-postgres first to set up slot (it handles SCRAM internally)
+    let dsn = format!(
+        "host=127.0.0.1 port={host_port} user=scram_user password=scram_test_password dbname=postgres"
+    );
+
+    let client = loop {
+        match tokio_postgres::connect(&dsn, NoTls).await {
+            Ok((client, conn)) => {
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                break client;
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(500)).await,
+        }
+    };
+
+    // Setup replication
+    client
+        .batch_execute("CREATE TABLE IF NOT EXISTS t(id INT PRIMARY KEY, v TEXT);")
+        .await?;
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS pub_scram;")
+        .await?;
+    client
+        .batch_execute("CREATE PUBLICATION pub_scram FOR TABLE t;")
+        .await?;
+    client
+        .batch_execute(
+            "SELECT pg_drop_replication_slot('slot_scram')
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_scram');",
+        )
+        .await?;
+    client
+        .batch_execute("SELECT * FROM pg_create_logical_replication_slot('slot_scram','pgoutput');")
+        .await?;
+
+    let base_lsn = current_wal_lsn(&client).await?;
+    info!("SCRAM test: base_lsn={base_lsn}");
+
+    // Now connect with our replication client using SCRAM
+    let config = ReplicationConfig {
+        host: "127.0.0.1".into(),
+        port: host_port,
+        user: "scram_user".into(),
+        password: "scram_test_password".into(),
+        database: "postgres".into(),
+        tls: TlsConfig::disabled(),
+        slot: "slot_scram".into(),
+        publication: "pub_scram".into(),
+        start_lsn: base_lsn,
+        stop_at_lsn: None,
+        status_interval: Duration::from_secs(1),
+        idle_timeout: Duration::from_secs(15),
+        buffer_events: 1024,
+    };
+
+    let mut repl = ReplicationClient::connect(config)
+        .await
+        .context("connect with SCRAM auth")?;
+
+    info!("SCRAM auth successful, waiting for keepalive");
+
+    // Verify connection works
+    let ka = recv_keepalive(&mut repl, Duration::from_secs(10)).await?;
+    info!("SCRAM test: received keepalive wal_end={ka}");
+
+    // Test actual replication
+    client
+        .execute("INSERT INTO t(id, v) VALUES (1, 'scram_test')", &[])
+        .await?;
+
+    let (wal_end, data, _) = recv_until_xlog(&mut repl, Duration::from_secs(10)).await?;
+    info!(
+        "SCRAM test: received XLogData wal_end={wal_end} bytes={}",
+        data.len()
+    );
+
+    anyhow::ensure!(
+        !data.is_empty(),
+        "expected payload from SCRAM-authenticated replication"
+    );
+
+    repl.stop();
+    let _ = repl.join().await;
+
+    info!("SCRAM authentication test completed successfully");
+    Ok(())
+}
+
+// ============================================================================
+// TLS Connection Test
+// ============================================================================
+
+/// Test TLS connection with certificate verification.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "tls-rustls")]
+async fn postgres_replication_tls() -> Result<()> {
+    use std::process::Command;
+
+    init_tracing();
+
+    let host_port = get_available_port();
+
+    // Create temp directory for certificates
+    let cert_dir = tempfile::tempdir()?;
+    let cert_path = cert_dir.path();
+
+    // Generate X.509v3 CA certificate (rustls requires v3 with proper extensions)
+    let ca_key = cert_path.join("ca.key");
+    let ca_cert = cert_path.join("ca.crt");
+
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-x509",
+            "-days",
+            "1",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            ca_key.to_str().unwrap(),
+            "-out",
+            ca_cert.to_str().unwrap(),
+            "-subj",
+            "/CN=Test-CA",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
+        ])
+        .status()
+        .context("generate CA cert")?;
+    anyhow::ensure!(status.success(), "openssl CA generation failed");
+
+    // Server key and CSR
+    let server_key = cert_path.join("server.key");
+    let server_csr = cert_path.join("server.csr");
+    let server_cert = cert_path.join("server.crt");
+
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            server_key.to_str().unwrap(),
+            "-out",
+            server_csr.to_str().unwrap(),
+            "-subj",
+            "/CN=localhost",
+        ])
+        .status()
+        .context("generate server key/CSR")?;
+    anyhow::ensure!(status.success(), "openssl server key generation failed");
+
+    // Create extensions file for server cert (X.509v3)
+    let ext_file = cert_path.join("server.ext");
+    std::fs::write(
+        &ext_file,
+        "basicConstraints=CA:FALSE\n\
+         keyUsage=critical,digitalSignature,keyEncipherment\n\
+         extendedKeyUsage=serverAuth\n\
+         subjectAltName=DNS:localhost,IP:127.0.0.1\n",
+    )?;
+
+    // Sign server cert with CA (with extensions for X.509v3)
+    let status = Command::new("openssl")
+        .args([
+            "x509",
+            "-req",
+            "-days",
+            "1",
+            "-in",
+            server_csr.to_str().unwrap(),
+            "-CA",
+            ca_cert.to_str().unwrap(),
+            "-CAkey",
+            ca_key.to_str().unwrap(),
+            "-CAcreateserial",
+            "-out",
+            server_cert.to_str().unwrap(),
+            "-extfile",
+            ext_file.to_str().unwrap(),
+        ])
+        .status()
+        .context("sign server cert")?;
+    anyhow::ensure!(status.success(), "openssl signing failed");
+
+    info!("generated TLS certificates in {}", cert_path.display());
+
+    // Start container with certs mounted
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_wait_for(WaitFor::message_on_stdout(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_mount(testcontainers::core::Mount::bind_mount(
+            cert_path.to_str().unwrap(),
+            "/certs",
+        ))
+        .with_cmd([
+            "sh",
+            "-c",
+            "chown postgres:postgres /certs/* && chmod 600 /certs/server.key && \
+             exec /usr/local/bin/docker-entrypoint.sh postgres \
+                -c wal_level=logical \
+                -c max_replication_slots=10 \
+                -c max_wal_senders=10 \
+                -c ssl=on \
+                -c ssl_cert_file=/certs/server.crt \
+                -c ssl_key_file=/certs/server.key \
+                -c ssl_ca_file=/certs/ca.crt",
+        ])
+        .with_mapped_port(host_port, 5432.tcp());
+
+    info!("starting postgres container with TLS on port {host_port}");
+    let container = image.start().await.expect("start postgres with TLS");
+    follow_container_logs(&container).await;
+
+    // Wait for postgres with TLS
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+
+    // Setup replication
+    client
+        .batch_execute("CREATE TABLE IF NOT EXISTS t(id INT PRIMARY KEY, v TEXT);")
+        .await?;
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS pub_tls;")
+        .await?;
+    client
+        .batch_execute("CREATE PUBLICATION pub_tls FOR TABLE t;")
+        .await?;
+    client
+        .batch_execute(
+            "SELECT pg_drop_replication_slot('slot_tls')
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_tls');",
+        )
+        .await?;
+    client
+        .batch_execute("SELECT * FROM pg_create_logical_replication_slot('slot_tls','pgoutput');")
+        .await?;
+
+    let base_lsn = current_wal_lsn(&client).await?;
+    info!("TLS test: base_lsn={base_lsn}");
+
+    // Connect with TLS (verify-ca mode since we're using localhost)
+    let tls_config = TlsConfig::verify_ca(Some(ca_cert.clone()));
+
+    let config = ReplicationConfig {
+        host: "127.0.0.1".into(),
+        port: host_port,
+        user: "postgres".into(),
+        password: "postgres".into(),
+        database: "postgres".into(),
+        tls: tls_config,
+        slot: "slot_tls".into(),
+        publication: "pub_tls".into(),
+        start_lsn: base_lsn,
+        stop_at_lsn: None,
+        status_interval: Duration::from_secs(1),
+        idle_timeout: Duration::from_secs(15),
+        buffer_events: 1024,
+    };
+
+    info!("TLS connection successful, waiting for keepalive");
+
+    let mut repl = ReplicationClient::connect(config)
+        .await
+        .context("connect with TLS")?;
+
+    // Verify connection works
+    let ka = recv_keepalive(&mut repl, Duration::from_secs(10)).await?;
+    info!("TLS test: received keepalive wal_end={ka}");
+
+    // Test actual replication over TLS
+    client
+        .execute("INSERT INTO t(id, v) VALUES (1, 'tls_test')", &[])
+        .await?;
+
+    let (wal_end, data, _) = recv_until_xlog(&mut repl, Duration::from_secs(10)).await?;
+    info!(
+        "TLS test: received XLogData wal_end={wal_end} bytes={}",
+        data.len()
+    );
+
+    anyhow::ensure!(
+        !data.is_empty(),
+        "expected payload from TLS-encrypted replication"
+    );
+
+    repl.stop();
+    let _ = repl.join().await;
+
+    info!("TLS connection test completed successfully");
+    Ok(())
+}
+
+/// Test TLS with require mode (no verification - just encryption).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "tls-rustls")]
+async fn postgres_replication_tls_require_mode() -> Result<()> {
+    use std::process::Command;
+
+    init_tracing();
+
+    let host_port = get_available_port();
+
+    // Create temp directory for certificates
+    let cert_dir = tempfile::tempdir()?;
+    let cert_path = cert_dir.path();
+
+    // Generate self-signed server certificate (no CA needed for require mode)
+    let server_key = cert_path.join("server.key");
+    let server_cert = cert_path.join("server.crt");
+
+    let status = Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-x509",
+            "-days",
+            "1",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            server_key.to_str().unwrap(),
+            "-out",
+            server_cert.to_str().unwrap(),
+            "-subj",
+            "/CN=localhost",
+        ])
+        .status()
+        .context("generate self-signed cert")?;
+    anyhow::ensure!(status.success(), "openssl generation failed");
+
+    info!("generated self-signed cert in {}", cert_path.display());
+
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_wait_for(WaitFor::message_on_stdout(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_mount(testcontainers::core::Mount::bind_mount(
+            cert_path.to_str().unwrap(),
+            "/certs",
+        ))
+        .with_cmd([
+            "sh",
+            "-c",
+            "chown postgres:postgres /certs/* && chmod 600 /certs/server.key && \
+             exec /usr/local/bin/docker-entrypoint.sh postgres \
+                -c wal_level=logical \
+                -c max_replication_slots=10 \
+                -c ssl=on \
+                -c ssl_cert_file=/certs/server.crt \
+                -c ssl_key_file=/certs/server.key",
+        ])
+        .with_mapped_port(host_port, 5432.tcp());
+
+    info!("starting postgres with TLS (require mode) on port {host_port}");
+    let container = image.start().await.expect("start postgres");
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+
+    // Setup
+    client
+        .batch_execute("CREATE TABLE IF NOT EXISTS t(id INT PRIMARY KEY, v TEXT);")
+        .await?;
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS pub_tls_req;")
+        .await?;
+    client
+        .batch_execute("CREATE PUBLICATION pub_tls_req FOR TABLE t;")
+        .await?;
+    client
+        .batch_execute(
+            "SELECT pg_drop_replication_slot('slot_tls_req')
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_tls_req');",
+        )
+        .await?;
+    client
+        .batch_execute(
+            "SELECT * FROM pg_create_logical_replication_slot('slot_tls_req','pgoutput');",
+        )
+        .await?;
+
+    let base_lsn = current_wal_lsn(&client).await?;
+
+    // Connect with TLS require mode (no verification)
+    let config = ReplicationConfig {
+        host: "127.0.0.1".into(),
+        port: host_port,
+        user: "postgres".into(),
+        password: "postgres".into(),
+        database: "postgres".into(),
+        tls: TlsConfig::require(),
+        slot: "slot_tls_req".into(),
+        publication: "pub_tls_req".into(),
+        start_lsn: base_lsn,
+        stop_at_lsn: None,
+        status_interval: Duration::from_secs(1),
+        idle_timeout: Duration::from_secs(15),
+        buffer_events: 1024,
+    };
+
+    let mut repl = ReplicationClient::connect(config)
+        .await
+        .context("connect with TLS require mode")?;
+
+    let ka = recv_keepalive(&mut repl, Duration::from_secs(10)).await?;
+    info!("TLS require mode: received keepalive wal_end={ka}");
+
+    // Verify replication works
+    client
+        .execute("INSERT INTO t(id, v) VALUES (1, 'tls_require')", &[])
+        .await?;
+    let (wal_end, data, _) = recv_until_xlog(&mut repl, Duration::from_secs(10)).await?;
+
+    anyhow::ensure!(!data.is_empty(), "expected payload");
+    info!("TLS require mode: replication working, wal_end={wal_end}");
+
+    repl.stop();
+    let _ = repl.join().await;
+
+    info!("TLS require mode test completed successfully");
+    Ok(())
+}
+
+/// Test that TLS verification fails with wrong CA.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(feature = "tls-rustls")]
+async fn postgres_replication_tls_wrong_ca_fails() -> Result<()> {
+    use std::process::Command;
+
+    init_tracing();
+
+    let host_port = get_available_port();
+    let cert_dir = tempfile::tempdir()?;
+    let cert_path = cert_dir.path();
+
+    // Generate server cert
+    let server_key = cert_path.join("server.key");
+    let server_cert = cert_path.join("server.crt");
+
+    Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-x509",
+            "-days",
+            "1",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            server_key.to_str().unwrap(),
+            "-out",
+            server_cert.to_str().unwrap(),
+            "-subj",
+            "/CN=localhost",
+        ])
+        .status()?;
+
+    // Generate a DIFFERENT CA (that didn't sign the server cert)
+    let wrong_ca = cert_path.join("wrong_ca.crt");
+    Command::new("openssl")
+        .args([
+            "req",
+            "-new",
+            "-x509",
+            "-days",
+            "1",
+            "-nodes",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            cert_path.join("wrong_ca.key").to_str().unwrap(),
+            "-out",
+            wrong_ca.to_str().unwrap(),
+            "-subj",
+            "/CN=Wrong-CA",
+        ])
+        .status()?;
+
+    let image = GenericImage::new("postgres", "16-alpine")
+        .with_wait_for(WaitFor::message_on_stdout(
+            "database system is ready to accept connections",
+        ))
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_mount(testcontainers::core::Mount::bind_mount(
+            cert_path.to_str().unwrap(),
+            "/certs",
+        ))
+        .with_cmd([
+            "sh",
+            "-c",
+            "chown postgres:postgres /certs/* && chmod 600 /certs/server.key && \
+             exec /usr/local/bin/docker-entrypoint.sh postgres \
+                -c wal_level=logical \
+                -c max_replication_slots=10 \
+                -c ssl=on \
+                -c ssl_cert_file=/certs/server.crt \
+                -c ssl_key_file=/certs/server.key",
+        ])
+        .with_mapped_port(host_port, 5432.tcp());
+
+    let container = image.start().await.expect("start postgres");
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+
+    client
+        .batch_execute("CREATE TABLE IF NOT EXISTS t(id INT PRIMARY KEY, v TEXT);")
+        .await?;
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS pub_wrong_ca;")
+        .await?;
+    client
+        .batch_execute("CREATE PUBLICATION pub_wrong_ca FOR TABLE t;")
+        .await?;
+    client
+        .batch_execute(
+            "SELECT pg_drop_replication_slot('slot_wrong_ca')
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_wrong_ca');",
+        )
+        .await?;
+    client
+        .batch_execute(
+            "SELECT * FROM pg_create_logical_replication_slot('slot_wrong_ca','pgoutput');",
+        )
+        .await?;
+
+    let base_lsn = current_wal_lsn(&client).await?;
+
+    // Try to connect with wrong CA - should fail verification
+    let config = ReplicationConfig {
+        host: "127.0.0.1".into(),
+        port: host_port,
+        user: "postgres".into(),
+        password: "postgres".into(),
+        database: "postgres".into(),
+        tls: TlsConfig::verify_ca(Some(wrong_ca)), // Wrong CA!
+        slot: "slot_wrong_ca".into(),
+        publication: "pub_wrong_ca".into(),
+        start_lsn: base_lsn,
+        stop_at_lsn: None,
+        status_interval: Duration::from_secs(1),
+        idle_timeout: Duration::from_secs(15),
+        buffer_events: 1024,
+    };
+
+    let result = ReplicationClient::connect(config).await;
+
+    match result {
+        Ok(mut repl) => {
+            // Connection might succeed but first operation should fail
+            let recv_result = repl.recv().await;
+            anyhow::ensure!(
+                recv_result.is_err(),
+                "expected TLS verification to fail with wrong CA"
+            );
+            info!("TLS verification failed as expected (on recv)");
+        }
+        Err(e) => {
+            info!("TLS verification failed as expected: {e}");
+            anyhow::ensure!(
+                e.to_string().to_lowercase().contains("tls")
+                    || e.to_string().to_lowercase().contains("certificate")
+                    || e.to_string().to_lowercase().contains("ssl")
+                    || e.to_string().to_lowercase().contains("verify"),
+                "expected TLS-related error, got: {e}"
+            );
+        }
+    }
+
+    info!("TLS wrong CA test completed successfully");
     Ok(())
 }
