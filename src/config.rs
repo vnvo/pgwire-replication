@@ -15,7 +15,7 @@ pub enum SslMode {
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
     pub mode: SslMode,
-    
+
     /// Path to a PEM file containing one or more CA certificates.
     /// If None and Verify* is used, use webpki-roots (system roots equivalent).
     pub ca_pem_path: Option<PathBuf>,
@@ -27,7 +27,7 @@ pub struct TlsConfig {
     pub client_cert_pem_path: Option<PathBuf>,
 
     /// Optional client private key (PEM). Enables mutual TLS.
-    pub client_key_pem_path: Option<PathBuf>,    
+    pub client_key_pem_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

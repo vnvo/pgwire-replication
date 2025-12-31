@@ -13,13 +13,13 @@ pub async fn connect_control_plane(
     password: &str,
     database: &str,
 ) -> anyhow::Result<tokio_postgres::Client> {
-    let dsn = format!(
-        "host={host} port={port} user={user} password={password} dbname={database}"
-    );
+    let dsn = format!("host={host} port={port} user={user} password={password} dbname={database}");
     let (client, conn) = tokio_postgres::connect(&dsn, NoTls)
         .await
         .context("connect (control plane)")?;
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
     Ok(client)
 }
 
@@ -32,9 +32,7 @@ pub async fn ensure_slot_and_get_start_lsn(
 ) -> anyhow::Result<Lsn> {
     // Publication: best-effort. In real systems you may manage publications via migrations.
     let _ = client
-        .batch_execute(&format!(
-            "CREATE PUBLICATION {publication} FOR ALL TABLES;"
-        ))
+        .batch_execute(&format!("CREATE PUBLICATION {publication} FOR ALL TABLES;"))
         .await;
 
     // Slot: create if absent (ignore errors for already-existing).
