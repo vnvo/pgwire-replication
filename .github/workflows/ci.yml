@@ -13,7 +13,6 @@ jobs:
   lint-and-test:
     name: Lint and unit tests
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,13 +29,32 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (default features)
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Clippy (all features)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Unit tests (default features)
-        run: cargo test --all-targets
+      - name: Unit tests
+        run: cargo test
+
+      - name: Doc tests
+        run: cargo test --doc
+
+      - name: Check docs build
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+  msrv:
+    name: MSRV check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.89
+      - run: cargo check --all-features
 
   integration-tests:
-    name: Integration tests (Docker, feature-gated)
+    name: Integration tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -48,12 +66,16 @@ jobs:
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Docker info
-        run: |
-          docker version
-          docker info
-
       - name: Integration tests
         env:
           RUST_BACKTRACE: "1"
         run: cargo test --features integration-tests -- --nocapture
+
+  security:
+    name: Security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
