@@ -1,47 +1,119 @@
-use std::fmt;
+//! PostgreSQL Log Sequence Number (LSN) type.
+//!
+//! LSN is a 64-bit value representing a position in the write-ahead log.
+//! PostgreSQL displays LSNs in the format `XXXXXXXX/YYYYYYYY` where both
+//! parts are hexadecimal.
 
+use std::fmt;
+use std::str::FromStr;
+
+/// Error returned when parsing an invalid LSN string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseLsnError(pub String);
 
-impl std::fmt::Display for ParseLsnError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ParseLsnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "invalid LSN: {}", self.0)
     }
 }
+
 impl std::error::Error for ParseLsnError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// PostgreSQL Log Sequence Number.
+///
+/// Represents a position in the write-ahead log (WAL). LSNs are used to
+/// track replication progress and identify specific points in the WAL stream.
+///
+/// # Format
+///
+/// PostgreSQL displays LSNs as `XXXXXXXX/YYYYYYYY` where:
+/// - `XXXXXXXX` is the high 32 bits (segment file number)
+/// - `YYYYYYYY` is the low 32 bits (offset within segment)
+///
+/// # Example
+///
+/// ```
+/// use pgwire_replication::lsn::Lsn;
+///
+/// let lsn = Lsn::parse("16/B374D848").unwrap();
+/// assert_eq!(lsn.to_string(), "16/B374D848");
+///
+/// // Or use FromStr
+/// let lsn: Lsn = "16/B374D848".parse().unwrap();
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Lsn(pub u64);
 
 impl Lsn {
+    /// The zero LSN, representing "start from the beginning" or "no position".
+    pub const ZERO: Lsn = Lsn(0);
+
+    /// Parse an LSN from PostgreSQL's `XXXXXXXX/YYYYYYYY` format.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ParseLsnError` if the string is not valid LSN format.
     pub fn parse(s: &str) -> Result<Lsn, ParseLsnError> {
-        let mut parts = s.split('/');
-        let hi = parts.next().ok_or_else(|| ParseLsnError(s.into()))?;
-        let lo = parts.next().ok_or_else(|| ParseLsnError(s.into()))?;
-        let hi = u64::from_str_radix(hi, 16).map_err(|_| ParseLsnError(s.into()))?;
-        let lo = u64::from_str_radix(lo, 16).map_err(|_| ParseLsnError(s.into()))?;
+        let (hi_str, lo_str) = s
+            .split_once('/')
+            .ok_or_else(|| ParseLsnError(format!("missing '/' separator: {s}")))?;
+
+        let hi = u64::from_str_radix(hi_str, 16)
+            .map_err(|_| ParseLsnError(format!("invalid high part '{hi_str}': {s}")))?;
+
+        let lo = u64::from_str_radix(lo_str, 16)
+            .map_err(|_| ParseLsnError(format!("invalid low part '{lo_str}': {s}")))?;
+
         Ok(Lsn((hi << 32) | lo))
     }
 
+    /// Format as PostgreSQL's `XXXXXXXX/YYYYYYYY` string.
+    #[inline]
     pub fn to_pg_string(self) -> String {
         format!("{:X}/{:X}", (self.0 >> 32) as u32, self.0 as u32)
+    }
+
+    /// Returns `true` if this is the zero LSN.
+    #[inline]
+    pub fn is_zero(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns the raw 64-bit value.
+    #[inline]
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+
+    /// Create an LSN from a raw 64-bit value.
+    #[inline]
+    pub fn from_u64(value: u64) -> Self {
+        Lsn(value)
     }
 }
 
 impl fmt::Display for Lsn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.to_pg_string())
+        write!(f, "{:X}/{:X}", (self.0 >> 32) as u32, self.0 as u32)
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Lsn;
+impl FromStr for Lsn {
+    type Err = ParseLsnError;
 
-    #[test]
-    fn lsn_parse_roundtrip() {
-        let s = "16/B374D848";
-        let l = Lsn::parse(s).unwrap();
-        assert_eq!(l.to_pg_string(), s);
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Lsn::parse(s)
+    }
+}
+
+impl From<u64> for Lsn {
+    fn from(value: u64) -> Self {
+        Lsn(value)
+    }
+}
+
+impl From<Lsn> for u64 {
+    fn from(lsn: Lsn) -> Self {
+        lsn.0
     }
 }
