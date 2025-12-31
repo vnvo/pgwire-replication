@@ -1,8 +1,4 @@
-#![cfg(feature = "examples")]
-
-/// cargo run --example bounded_replay --features examples
-
-#[path = "common.rs"]
+#[path = "_shared/common.rs"]
 mod common;
 
 use pgwire_replication::{
@@ -18,7 +14,7 @@ async fn current_wal_lsn(sql: &tokio_postgres::Client) -> anyhow::Result<Lsn> {
         .query_one("SELECT pg_current_wal_lsn()::text", &[])
         .await?;
     let s: String = row.get(0);
-    Ok(Lsn::parse(&s)?)
+    Ok(Lsn::parse(&s).unwrap())
 }
 
 #[tokio::main]

@@ -1,6 +1,4 @@
-#![cfg(feature = "examples")]
-
-#[path = "common.rs"]
+#[path = "_shared/common.rs"]
 mod common;
 
 use pgwire_replication::{
@@ -44,6 +42,8 @@ async fn main() -> anyhow::Result<()> {
             mode: SslMode::VerifyFull,
             ca_pem_path: Some(ca_pem_path),
             sni_hostname: Some(sni_hostname),
+            client_cert_pem_path: None,
+            client_key_pem_path: None,
         },
 
         slot: slot.into(),

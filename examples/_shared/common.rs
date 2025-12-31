@@ -1,5 +1,3 @@
-#![cfg(feature = "examples")]
-
 use anyhow::Context;
 use tokio_postgres::NoTls;
 

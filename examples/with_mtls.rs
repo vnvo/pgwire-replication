@@ -1,6 +1,4 @@
-#![cfg(feature = "examples")]
-
-#[path = "common.rs"]
+#[path = "_shared/common.rs"]
 mod common;
 
 use pgwire_replication::{
