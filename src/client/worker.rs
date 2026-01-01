@@ -153,9 +153,18 @@ impl WorkerState {
             }
 
             // Read next message with idle timeout
-            let msg = tokio::time::timeout(self.cfg.idle_timeout, read_backend_message(stream))
-                .await
-                .map_err(|_| PgWireError::Protocol("replication idle timeout".into()))??;
+            let msg =
+                match tokio::time::timeout(self.cfg.idle_timeout, read_backend_message(stream))
+                    .await
+                {
+                    Ok(res) => res?, // read_backend_message result
+                    Err(_) => {
+                        // No message received in idle_timeout; keep the connection alive by sending feedback
+                        self.send_feedback(stream, last_applied, false).await?;
+                        last_status_sent = Instant::now();
+                        continue;
+                    }
+                };
 
             match msg.tag {
                 b'd' => {
@@ -173,8 +182,7 @@ impl WorkerState {
                 }
                 b'E' => {
                     let err = PgWireError::Server(parse_error_response(&msg.payload));
-                    self.send_event(Err(err)).await;
-                    return Ok(());
+                    return Err(err);
                 }
                 _ => {
                     // Unexpected in CopyBoth mode, but ignore gracefully

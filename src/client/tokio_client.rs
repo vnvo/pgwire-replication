@@ -27,8 +27,8 @@ use super::worker::{ReplicationEvent, ReplicationEventReceiver, WorkerState};
 ///
 /// let mut client = ReplicationClient::connect(config).await?;
 ///
-/// loop {
-///     match client.recv().await? {
+/// while let Some(ev) = client.recv().await? {
+///     match ev {
 ///         ReplicationEvent::XLogData { data, wal_end, .. } => {
 ///             // Process the change event
 ///             process_change(&data);
@@ -40,10 +40,10 @@ use super::worker::{ReplicationEvent, ReplicationEventReceiver, WorkerState};
 ///         }
 ///         ReplicationEvent::StoppedAt { reached } => {
 ///             println!("Reached stop LSN: {reached}");
-///             break;
 ///         }
 ///     }
 /// }
+/// // Normal termination
 /// ```
 ///
 /// # Shutdown
@@ -96,34 +96,32 @@ impl ReplicationClient {
 
     /// Receive the next replication event.
     ///
-    /// This method blocks until an event is available or an error occurs.
-    /// If the worker task has terminated, this will return the error that
-    /// caused the termination.
+    /// - `Ok(Some(event))` => received an event
+    /// - `Ok(None)`        => replication ended normally (stop requested or stop_at_lsn reached)
+    /// - `Err(e)`          => replication ended abnormally
     ///
     /// # Errors
     ///
     /// - Server errors (e.g., slot dropped, connection lost)
     /// - Protocol errors
     /// - Worker panic
-    pub async fn recv(&mut self) -> Result<ReplicationEvent> {
+    pub async fn recv(&mut self) -> Result<Option<ReplicationEvent>> {
         match self.rx.recv().await {
-            Some(Ok(ev)) => Ok(ev),
+            Some(Ok(ev)) => Ok(Some(ev)),
             Some(Err(e)) => Err(e),
             None => self.handle_worker_shutdown().await,
         }
     }
 
     /// Handle the case where the worker channel is closed.
-    async fn handle_worker_shutdown(&mut self) -> Result<ReplicationEvent> {
+    async fn handle_worker_shutdown(&mut self) -> Result<Option<ReplicationEvent>> {
         let join = self
             .join
             .take()
             .ok_or_else(|| PgWireError::Internal("replication worker already joined".into()))?;
 
         match join.await {
-            Ok(Ok(())) => Err(PgWireError::Internal(
-                "replication worker exited cleanly but channel closed".into(),
-            )),
+            Ok(Ok(())) => Ok(None), // clean exit => end of stream
             Ok(Err(e)) => Err(e),
             Err(join_err) => Err(PgWireError::Task(format!(
                 "replication worker panicked: {join_err}"
@@ -150,7 +148,7 @@ impl ReplicationClient {
     /// Request the worker to stop gracefully.
     ///
     /// After calling this, [`recv()`](Self::recv) will return remaining buffered
-    /// events, then an error indicating the stream has ended.
+    /// events, then `Ok(None)` once the worker exits cleanly.
     ///
     /// This sends a CopyDone message to the server to cleanly terminate
     /// the replication stream.
@@ -203,7 +201,7 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
 
     #[cfg(feature = "tls-rustls")]
     {
-        use crate::tls::rustls::{MaybeTlsStream, maybe_upgrade_to_tls};
+        use crate::tls::rustls::{maybe_upgrade_to_tls, MaybeTlsStream};
         let upgraded = maybe_upgrade_to_tls(tcp, &cfg.tls, &cfg.host).await?;
         match upgraded {
             MaybeTlsStream::Plain(mut s) => worker.run_on_stream(&mut s).await,
