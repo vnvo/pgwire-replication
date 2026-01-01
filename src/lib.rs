@@ -30,8 +30,8 @@
 //!
 //! let mut client = ReplicationClient::connect(config).await?;
 //!
-//! loop {
-//!     match client.recv().await? {
+//! while let Some(ev) = client.recv().await? {
+//!     match ev {
 //!         ReplicationEvent::XLogData { wal_end, data, .. } => {
 //!             println!("Got data at {}: {} bytes", wal_end, data.len());
 //!         }

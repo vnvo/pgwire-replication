@@ -153,18 +153,20 @@ impl WorkerState {
             }
 
             // Read next message with idle timeout
-            let msg =
-                match tokio::time::timeout(self.cfg.idle_timeout, read_backend_message(stream))
-                    .await
-                {
-                    Ok(res) => res?, // read_backend_message result
-                    Err(_) => {
-                        // No message received in idle_timeout; keep the connection alive by sending feedback
-                        self.send_feedback(stream, last_applied, false).await?;
-                        last_status_sent = Instant::now();
-                        continue;
-                    }
-                };
+            let msg = match tokio::time::timeout(
+                self.cfg.idle_wakeup_interval,
+                read_backend_message(stream),
+            )
+            .await
+            {
+                Ok(res) => res?, // read_backend_message result
+                Err(_) => {
+                    // No message received in idle_timeout; keep the connection alive by sending feedback
+                    self.send_feedback(stream, last_applied, false).await?;
+                    last_status_sent = Instant::now();
+                    continue;
+                }
+            };
 
             match msg.tag {
                 b'd' => {

@@ -36,7 +36,7 @@ pub async fn main() -> anyhow::Result<()> {
         stop_at_lsn: None,
 
         status_interval: std::time::Duration::from_secs(1),
-        idle_timeout: std::time::Duration::from_secs(30),
+        idle_wakeup_interval: std::time::Duration::from_secs(30),
         buffer_events: 8192,
     };
 
@@ -68,7 +68,7 @@ pub async fn main() -> anyhow::Result<()> {
             }
             Err(e) => {
                 eprintln!("Replication failed: {e}");
-                return Err(e.into())
+                return Err(e.into());
             }
         }
     }

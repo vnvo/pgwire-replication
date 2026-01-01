@@ -294,14 +294,17 @@ pub struct ReplicationConfig {
     /// Default: 1 second (matches pg_recvlogical)
     pub status_interval: Duration,
 
-    /// Maximum time to wait for server messages before treating as error.
+    /// Maximum time to wait for server messages before waking up.
     ///
-    /// If no XLogData or KeepAlive messages are received within this interval,
-    /// the connection is considered dead. Should be longer than the server's
-    /// `wal_sender_timeout` setting.
+    /// Silence is normal during logical replication. When this interval elapses
+    /// with no incoming messages, the client will send a standby status update
+    /// (feedback) and continue waiting.
     ///
-    /// Default: 30 seconds
-    pub idle_timeout: Duration,
+    /// This effectively bounds how long the worker can stay blocked in a read
+    /// while idle.
+    ///
+    /// Default: 10 seconds
+    pub idle_wakeup_interval: Duration,
 
     /// Size of the bounded event buffer between replication worker and consumer.
     ///
@@ -325,8 +328,8 @@ impl Default for ReplicationConfig {
             publication: "pub".into(),
             start_lsn: Lsn(0),
             stop_at_lsn: None,
-            status_interval: Duration::from_secs(1),
-            idle_timeout: Duration::from_secs(30),
+            status_interval: Duration::from_secs(10),
+            idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
         }
     }
@@ -399,9 +402,9 @@ impl ReplicationConfig {
         self
     }
 
-    /// Set the idle timeout.
-    pub fn with_idle_timeout(mut self, timeout: Duration) -> Self {
-        self.idle_timeout = timeout;
+    /// Set the idle wakeup interval.
+    pub fn with_wakeup_interval(mut self, timeout: Duration) -> Self {
+        self.idle_wakeup_interval = timeout;
         self
     }
 

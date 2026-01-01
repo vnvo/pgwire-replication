@@ -201,7 +201,7 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
 
     #[cfg(feature = "tls-rustls")]
     {
-        use crate::tls::rustls::{maybe_upgrade_to_tls, MaybeTlsStream};
+        use crate::tls::rustls::{MaybeTlsStream, maybe_upgrade_to_tls};
         let upgraded = maybe_upgrade_to_tls(tcp, &cfg.tls, &cfg.host).await?;
         match upgraded {
             MaybeTlsStream::Plain(mut s) => worker.run_on_stream(&mut s).await,

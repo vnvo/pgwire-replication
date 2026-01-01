@@ -50,7 +50,7 @@ pub async fn main() -> anyhow::Result<()> {
         stop_at_lsn: Some(stop_at_lsn),
 
         status_interval: std::time::Duration::from_secs(1),
-        idle_timeout: std::time::Duration::from_secs(30),
+        idle_wakeup_interval: std::time::Duration::from_secs(30),
         buffer_events: 8192,
     };
 

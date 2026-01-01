@@ -45,8 +45,7 @@
 //!
 //!     let mut client = ReplicationClient::connect(config).await?;
 //!
-//!     loop {
-//!         let event = client.recv().await?;
+//!     while let Some(event) = client.recv().await? {
 //!         match event {
 //!             ReplicationEvent::XLogData { data, wal_end, .. } => {
 //!                 // Parse and process pgoutput data
