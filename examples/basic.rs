@@ -43,21 +43,32 @@ pub async fn main() -> anyhow::Result<()> {
     let mut repl = ReplicationClient::connect(cfg).await?;
 
     loop {
-        match repl.recv().await? {
-            ReplicationEvent::XLogData { wal_end, data, .. } => {
-                println!("XLogData wal_end={wal_end} bytes={}", data.len());
-                repl.update_applied_lsn(wal_end);
-            }
-            ReplicationEvent::KeepAlive {
-                wal_end,
-                reply_requested,
-                ..
-            } => {
-                println!("KeepAlive wal_end={wal_end} reply_requested={reply_requested}");
-            }
-            ReplicationEvent::StoppedAt { reached } => {
-                println!("StoppedAt reached={reached}");
+        match repl.recv().await {
+            Ok(Some(ev)) => match ev {
+                ReplicationEvent::XLogData { wal_end, data, .. } => {
+                    println!("XLogData wal_end={wal_end} bytes={}", data.len());
+                    repl.update_applied_lsn(wal_end);
+                }
+                ReplicationEvent::KeepAlive {
+                    wal_end,
+                    reply_requested,
+                    ..
+                } => {
+                    println!("KeepAlive wal_end={wal_end} reply_requested={reply_requested}");
+                }
+                ReplicationEvent::StoppedAt { reached } => {
+                    println!("StoppedAt reached={reached}");
+                    // break is optional; the stream should end shortly anyway
+                    break;
+                }
+            },
+            Ok(None) => {
+                println!("Replication ended cleanly");
                 break;
+            }
+            Err(e) => {
+                eprintln!("Replication failed: {e}");
+                return Err(e.into())
             }
         }
     }
