@@ -218,7 +218,7 @@ fn replication_config(
         start_lsn,
         stop_at_lsn,
         status_interval: Duration::from_secs(1),
-        idle_timeout: Duration::from_secs(15),
+        idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 2048,
     }
 }
@@ -249,6 +249,9 @@ async fn recv_until_xlog(
 
     while Instant::now() < deadline {
         let ev = client.recv().await.context("recv replication event")?;
+        let Some(ev) = ev else {
+            anyhow::bail!("replication stream ended unexpectedly");
+        };
         match ev {
             ReplicationEvent::XLogData { wal_end, data, .. } => {
                 debug!("received XLogData wal_end={wal_end} bytes={}", data.len());
@@ -282,15 +285,16 @@ async fn drain_xlog_events(
 
     loop {
         match tokio::time::timeout(idle_timeout, client.recv()).await {
-            Ok(Ok(ReplicationEvent::XLogData { wal_end, .. })) => {
+            Ok(Ok(Some(ReplicationEvent::XLogData { wal_end, .. }))) => {
                 client.update_applied_lsn(wal_end);
                 count += 1;
             }
-            Ok(Ok(ReplicationEvent::KeepAlive { .. })) => {
+            Ok(Ok(Some(ReplicationEvent::KeepAlive { .. }))) => {
                 // Idle - we've caught up
                 break;
             }
-            Ok(Ok(ReplicationEvent::StoppedAt { .. })) => break,
+            Ok(Ok(Some(ReplicationEvent::StoppedAt { .. }))) => break,
+            Ok(Ok(None)) => break, // stream ended cleanly
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => break, // timeout - assume caught up
         }
@@ -303,6 +307,9 @@ async fn recv_keepalive(client: &mut ReplicationClient, timeout: Duration) -> Re
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let ev = client.recv().await.context("recv replication event")?;
+        let Some(ev) = ev else {
+            anyhow::bail!("replication stream ended unexpectedly");
+        };
         match ev {
             ReplicationEvent::KeepAlive { wal_end, .. } => return Ok(wal_end),
             ReplicationEvent::XLogData { wal_end, .. } => {
@@ -320,6 +327,9 @@ async fn recv_stopped_at(client: &mut ReplicationClient, timeout: Duration) -> R
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         let ev = client.recv().await.context("recv replication event")?;
+        let Some(ev) = ev else {
+            anyhow::bail!("replication stream ended unexpectedly");
+        };
         match ev {
             ReplicationEvent::StoppedAt { reached } => return Ok(reached),
             ReplicationEvent::XLogData { wal_end, .. } => client.update_applied_lsn(wal_end),
@@ -802,7 +812,7 @@ host    replication     all             ::/0                    scram-sha-256
         start_lsn: base_lsn,
         stop_at_lsn: None,
         status_interval: Duration::from_secs(1),
-        idle_timeout: Duration::from_secs(15),
+        idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 1024,
     };
 
@@ -1016,7 +1026,7 @@ async fn postgres_replication_tls() -> Result<()> {
         start_lsn: base_lsn,
         stop_at_lsn: None,
         status_interval: Duration::from_secs(1),
-        idle_timeout: Duration::from_secs(15),
+        idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 1024,
     };
 
@@ -1161,7 +1171,7 @@ async fn postgres_replication_tls_require_mode() -> Result<()> {
         start_lsn: base_lsn,
         stop_at_lsn: None,
         status_interval: Duration::from_secs(1),
-        idle_timeout: Duration::from_secs(15),
+        idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 1024,
     };
 
@@ -1309,7 +1319,7 @@ async fn postgres_replication_tls_wrong_ca_fails() -> Result<()> {
         start_lsn: base_lsn,
         stop_at_lsn: None,
         status_interval: Duration::from_secs(1),
-        idle_timeout: Duration::from_secs(15),
+        idle_wakeup_interval: Duration::from_secs(15),
         buffer_events: 1024,
     };
 
