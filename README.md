@@ -39,8 +39,8 @@ pgwire-replication = { version = "0.1", default-features = false, features = ["t
 
 ## Requirements
 
-- Rust 1.89 or later
-- PostgreSQL 15+ with logical replication enabled
+- Rust 1.75 or later
+- PostgreSQL 15+ with logical replication enabled (older versions will probably work too)
 
 ## Features
 
