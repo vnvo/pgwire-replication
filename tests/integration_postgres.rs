@@ -12,12 +12,12 @@
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use pgwire_replication::{
-    Lsn, ReplicationClient, ReplicationConfig, TlsConfig, client::ReplicationEvent,
+    client::ReplicationEvent, Lsn, ReplicationClient, ReplicationConfig, TlsConfig,
 };
 use std::time::{Duration, Instant};
-use testcontainers::ContainerRequest;
 use testcontainers::runners::AsyncRunner;
-use testcontainers::{GenericImage, ImageExt, core::IntoContainerPort, core::WaitFor};
+use testcontainers::ContainerRequest;
+use testcontainers::{core::IntoContainerPort, core::WaitFor, GenericImage, ImageExt};
 use tokio::io::AsyncBufReadExt;
 use tokio::task;
 use tokio_postgres::NoTls;

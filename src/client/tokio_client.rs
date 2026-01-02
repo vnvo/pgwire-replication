@@ -17,33 +17,43 @@ use super::worker::{ReplicationEvent, ReplicationEventReceiver, WorkerState};
 ///
 /// # Example
 ///
-/// ```ignore
-/// use pgwire_replication::client::ReplicationClient;
+/// ```no_run
+/// use pgwire_replication::client::{ReplicationClient, ReplicationEvent};
 /// use pgwire_replication::config::ReplicationConfig;
 ///
-/// let config = ReplicationConfig::new(
-///     "localhost", "postgres", "password", "mydb", "my_slot", "my_pub"
-/// );
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let config = ReplicationConfig::new(
+///         "localhost",
+///         "postgres",
+///         "password",
+///         "mydb",
+///         "my_slot",
+///         "my_pub",
+///     );
 ///
-/// let mut client = ReplicationClient::connect(config).await?;
+///     let mut client = ReplicationClient::connect(config).await?;
 ///
-/// while let Some(ev) = client.recv().await? {
-///     match ev {
-///         ReplicationEvent::XLogData { data, wal_end, .. } => {
-///             // Process the change event
-///             process_change(&data);
-///             // Report progress
-///             client.update_applied_lsn(wal_end);
-///         }
-///         ReplicationEvent::KeepAlive { .. } => {
-///             // Server heartbeat, automatically handled
-///         }
-///         ReplicationEvent::StoppedAt { reached } => {
-///             println!("Reached stop LSN: {reached}");
+///     while let Some(ev) = client.recv().await? {
+///         match ev {
+///             ReplicationEvent::XLogData { data, wal_end, .. } => {
+///                 process_change(&data);
+///                 client.update_applied_lsn(wal_end);
+///             }
+///             ReplicationEvent::KeepAlive { .. } => {}
+///             ReplicationEvent::StoppedAt { reached } => {
+///                 println!("Reached stop LSN: {reached}");
+///                 break;
+///             }
 ///         }
 ///     }
+///
+///     Ok(())
 /// }
-/// // Normal termination
+///
+/// fn process_change(_data: &bytes::Bytes) {
+///     // user-defined
+/// }
 /// ```
 ///
 /// # Shutdown
@@ -258,7 +268,7 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
 
     #[cfg(feature = "tls-rustls")]
     {
-        use crate::tls::rustls::{MaybeTlsStream, maybe_upgrade_to_tls};
+        use crate::tls::rustls::{maybe_upgrade_to_tls, MaybeTlsStream};
         let upgraded = maybe_upgrade_to_tls(tcp, &cfg.tls, &cfg.host).await?;
         match upgraded {
             MaybeTlsStream::Plain(mut s) => worker.run_on_stream(&mut s).await,

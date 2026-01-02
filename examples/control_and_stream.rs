@@ -4,7 +4,7 @@
 
 use anyhow::Context;
 use pgwire_replication::{
-    Lsn, ReplicationClient, ReplicationConfig, TlsConfig, client::ReplicationEvent,
+    client::ReplicationEvent, Lsn, ReplicationClient, ReplicationConfig, TlsConfig,
 };
 
 use tokio_postgres::NoTls;

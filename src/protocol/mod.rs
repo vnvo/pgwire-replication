@@ -25,8 +25,8 @@ pub mod messages;
 pub mod replication;
 
 pub use framing::BackendMessage;
-pub use messages::{ErrorFields, parse_auth_request, parse_error_response};
+pub use messages::{parse_auth_request, parse_error_response, ErrorFields};
 pub use replication::{
-    PG_EPOCH_MICROS, ReplicationCopyData, encode_standby_status_update, parse_copy_data,
-    pg_to_unix_timestamp, unix_to_pg_timestamp,
+    encode_standby_status_update, parse_copy_data, pg_to_unix_timestamp, unix_to_pg_timestamp,
+    ReplicationCopyData, PG_EPOCH_MICROS,
 };

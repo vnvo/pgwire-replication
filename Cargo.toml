@@ -1,8 +1,8 @@
 [package]
 name = "pgwire-replication"
 version = "0.1.0"
-edition = "2024"
-rust-version = "1.89"
+edition = "2021"
+rust-version = "1.74"
 license = "Apache-2.0 OR MIT"
 
 authors = ["Vahid Negahdari <vahid.negahdari@gmail.com>"]

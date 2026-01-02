@@ -28,9 +28,10 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```no_run
 //! use pgwire_replication::client::ReplicationClient;
 //! use pgwire_replication::config::ReplicationConfig;
+//! use pgwire_replication::ReplicationEvent;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {

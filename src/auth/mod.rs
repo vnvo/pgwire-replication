@@ -13,21 +13,31 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use pgwire_replication::auth::scram::ScramClient;
+//! ```no_run
+//! #[cfg(feature = "scram")]
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     use pgwire_replication::auth::scram::ScramClient;
+//!     // Create SCRAM client with random nonce
+//!     let client = ScramClient::new("postgres");
 //!
-//! // Create SCRAM client with random nonce
-//! let client = ScramClient::new("postgres");
+//!     // Send client-first-message to server
+//!     let _client_first = &client.client_first;
 //!
-//! // Send client-first-message to server
-//! let client_first = &client.client_first;
+//!     // In a real exchange, these come from the server.
+//!     // Placeholders here so the example compiles.
+//!     let server_first = String::new();
+//!     let server_final = String::new();
 //!
-//! // After receiving server-first-message, compute response
-//! let (client_final, auth_msg, salted_pw) = client
-//!     .client_final("mypassword", &server_first)?;
+//!     // After receiving server-first-message, compute response
+//!     let (client_final, auth_msg, salted_pw) =
+//!         client.client_final("mypassword", &server_first)?;
+//!     let _ = client_final;
 //!
-//! // After receiving server-final-message, verify server
-//! ScramClient::verify_server_final(&server_final, &salted_pw, &auth_msg)?;
+//!     // After receiving server-final-message, verify server
+//!     ScramClient::verify_server_final(&server_final, &salted_pw, &auth_msg)?;
+//!
+//!     Ok(())
+//! }
 //! ```
 //!
 //! # Unsupported Methods

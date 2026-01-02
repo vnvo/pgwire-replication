@@ -3,10 +3,10 @@
 //! Run with: `cargo bench --bench protocol_bench`
 
 use bytes::Bytes;
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
 use pgwire_replication::lsn::Lsn;
-use pgwire_replication::protocol::messages::{ErrorFields, parse_error_response};
+use pgwire_replication::protocol::messages::{parse_error_response, ErrorFields};
 use pgwire_replication::protocol::replication::{encode_standby_status_update, parse_copy_data};
 
 /// Generate a realistic XLogData payload

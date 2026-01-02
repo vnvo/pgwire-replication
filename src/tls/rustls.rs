@@ -26,17 +26,27 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use pgwire_replication::tls::rustls::maybe_upgrade_to_tls;
-//! use pgwire_replication::config::{SslMode, TlsConfig};
+//! ```no_run
+//! use pgwire_replication::config::TlsConfig;
+//! use pgwire_replication::tls::rustls::{maybe_upgrade_to_tls, MaybeTlsStream};
+//! use tokio::net::TcpStream;
+//! use std::path::PathBuf;
 //!
-//! let tls_config = TlsConfig {
-//!     mode: SslMode::VerifyFull,
-//!     ca_pem_path: Some("/path/to/ca.pem".into()),
-//!     ..Default::default()
-//! };
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let tls_config = TlsConfig::verify_full(Some(PathBuf::new()))
+//!         .with_sni_hostname("db.example.com");
 //!
-//! let stream = maybe_upgrade_to_tls(tcp_stream, &tls_config, "db.example.com").await?;
+//!     let tcp_stream = TcpStream::connect(("db.example.com", 5432)).await?;
+//!
+//!     let stream = maybe_upgrade_to_tls(tcp_stream, &tls_config, "db.example.com").await?;
+//!     match stream {
+//!         MaybeTlsStream::Plain(_) => {}
+//!         MaybeTlsStream::Tls(_) => {}
+//!     }
+//!
+//!     Ok(())
+//! }
 //! ```
 
 use std::pin::Pin;
@@ -46,7 +56,7 @@ use std::{fs::File, io::BufReader, sync::Arc};
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
-use tokio_rustls::{TlsConnector, client::TlsStream};
+use tokio_rustls::{client::TlsStream, TlsConnector};
 
 use crate::config::{SslMode, TlsConfig};
 use crate::error::{PgWireError, Result};

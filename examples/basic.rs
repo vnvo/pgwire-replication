@@ -3,7 +3,7 @@
 // START_LSN="0/16B6C50" cargo run --example basic --features examples
 
 use pgwire_replication::{
-    Lsn, ReplicationClient, ReplicationConfig, TlsConfig, client::ReplicationEvent,
+    client::ReplicationEvent, Lsn, ReplicationClient, ReplicationConfig, TlsConfig,
 };
 
 fn env(name: &str, default: &str) -> String {

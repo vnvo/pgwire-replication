@@ -180,7 +180,7 @@ mod tests {
         v.extend_from_slice(&1i64.to_be_bytes()); // wal_start
         v.extend_from_slice(&2i64.to_be_bytes()); // wal_end
         v.extend_from_slice(&3i64.to_be_bytes()); // server_time
-        // no data payload
+                                                  // no data payload
 
         let msg = parse_copy_data(Bytes::from(v)).unwrap();
         match msg {

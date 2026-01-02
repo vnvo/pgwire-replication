@@ -12,25 +12,28 @@
 //!
 //! # Example Flow
 //!
-//! ```ignore
-//! // 1. Client creates first message
-//! let client = ScramClient::new("username");
-//! send_sasl_initial(b"SCRAM-SHA-256", client.client_first.as_bytes());
+//! ```no_run
+//! use pgwire_replication::auth::scram::ScramClient;
 //!
-//! // 2. Server responds with challenge
-//! let server_first = receive_sasl_continue();
+//! fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     let client = ScramClient::new("postgres");
 //!
-//! // 3. Client computes response with password
-//! let (client_final, auth_msg, salted_pw) = client.client_final("password", &server_first)?;
-//! send_sasl_response(client_final.as_bytes());
+//!     // Send to server: client.client_first.as_bytes()
+//!     let server_first = String::new(); // received from server
 //!
-//! // 4. Verify server's proof
-//! let server_final = receive_sasl_final();
-//! ScramClient::verify_server_final(&server_final, &salted_pw, &auth_msg)?;
+//!     let (client_final, auth_msg, salted_pw) =
+//!         client.client_final("password", &server_first)?;
+//!
+//!     // Send to server: client_final.as_bytes()
+//!     let server_final = String::new(); // received from server
+//!
+//!     ScramClient::verify_server_final(&server_final, &salted_pw, &auth_msg)?;
+//!     Ok(())
+//! }
 //! ```
 
 #[cfg(feature = "scram")]
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 #[cfg(feature = "scram")]
 use hmac::{Hmac, Mac};
 #[cfg(feature = "scram")]

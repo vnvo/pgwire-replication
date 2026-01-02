@@ -5,7 +5,7 @@
 #[path = "support/common.rs"]
 mod common;
 use pgwire_replication::{
-    Lsn, ReplicationClient, ReplicationConfig, TlsConfig, client::ReplicationEvent,
+    client::ReplicationEvent, Lsn, ReplicationClient, ReplicationConfig, TlsConfig,
 };
 fn env(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())

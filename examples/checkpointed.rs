@@ -6,7 +6,7 @@
 mod common;
 
 use pgwire_replication::{
-    ReplicationClient, ReplicationConfig, TlsConfig, client::ReplicationEvent,
+    client::ReplicationEvent, ReplicationClient, ReplicationConfig, TlsConfig,
 };
 
 fn env(name: &str, default: &str) -> String {

@@ -12,7 +12,7 @@ use crate::protocol::framing::{
 };
 use crate::protocol::messages::{parse_auth_request, parse_error_response};
 use crate::protocol::replication::{
-    PG_EPOCH_MICROS, ReplicationCopyData, encode_standby_status_update, parse_copy_data,
+    encode_standby_status_update, parse_copy_data, ReplicationCopyData, PG_EPOCH_MICROS,
 };
 
 /// Events emitted by the replication worker.
@@ -231,23 +231,23 @@ impl WorkerState {
                 data,
             } => {
                 // Check stop condition
-                if let Some(stop_lsn) = self.cfg.stop_at_lsn
-                    && wal_end >= stop_lsn
-                {
-                    // Send final event, then stop signal
-                    self.send_event(Ok(ReplicationEvent::XLogData {
-                        wal_start,
-                        wal_end,
-                        server_time_micros,
-                        data,
-                    }))
-                    .await;
-
-                    self.send_event(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
+                if let Some(stop_lsn) = self.cfg.stop_at_lsn {
+                    if wal_end >= stop_lsn {
+                        // Send final event, then stop signal
+                        self.send_event(Ok(ReplicationEvent::XLogData {
+                            wal_start,
+                            wal_end,
+                            server_time_micros,
+                            data,
+                        }))
                         .await;
 
-                    let _ = write_copy_done(stream).await;
-                    return Ok(true);
+                        self.send_event(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
+                            .await;
+
+                        let _ = write_copy_done(stream).await;
+                        return Ok(true);
+                    }
                 }
 
                 self.send_event(Ok(ReplicationEvent::XLogData {
