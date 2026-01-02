@@ -167,6 +167,13 @@ waiting for server messages before waking up to send a standby status update and
 While the system is idle, the effective feedback cadence is bounded by
 `idle_wakeup_interval`, not `status_interval`.
 
+## Shutdown
+
+- `stop()` requests a graceful stop (sends `CopyDone`). The client will continue to yield any buffered events and then `recv()` returns `Ok(None)`.
+- `shutdown().await` is a convenience method that calls `stop()`, drains remaining events, and awaits the worker task result.
+- `abort()` cancels the worker task immediately (hard stop; does not send `CopyDone`).
+
+Dropping `ReplicationClient` requests a best-effort graceful stop. When dropped inside a Tokio runtime, the worker is detached and allowed to finish cleanly; when dropped outside a runtime, the worker may be aborted to avoid leaking a task.
 
 ## Important Notes on LSN Semantics
 
