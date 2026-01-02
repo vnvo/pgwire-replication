@@ -180,16 +180,73 @@ impl ReplicationClient {
             Err(e) => Err(PgWireError::Task(format!("join error: {e}"))),
         }
     }
+
+    /// Abort the worker task immediately.
+    ///
+    /// This is a hard cancel and does not send CopyDone.
+    /// Prefer `stop()`/`shutdown()` for graceful termination.
+    pub fn abort(&mut self) {
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
+    }
+
+    /// Request a graceful stop and wait for the worker to exit.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        self.stop();
+
+        // Drain events until the worker closes the channel.
+        while let Some(msg) = self.rx.recv().await {
+            match msg {
+                Ok(_ev) => {
+                    // discard; caller can drain themselves if they need events
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        // Now await the worker result (and surface panics/errors).
+        self.join_mut().await
+    }
+
+    /// Wait for the worker task to complete and return its result.
+    pub async fn join_mut(&mut self) -> Result<()> {
+        let join = self
+            .join
+            .take()
+            .ok_or_else(|| PgWireError::Task("worker already joined".into()))?;
+
+        match join.await {
+            Ok(inner) => inner.map_err(Into::into),
+            Err(e) => Err(PgWireError::Task(format!("join error: {e}")).into()),
+        }
+    }
 }
 
 impl Drop for ReplicationClient {
     fn drop(&mut self) {
-        // Signal worker to stop (best-effort cleanup)
+        // Best-effort graceful stop.
         let _ = self.stop_tx.send(true);
 
-        // Abort the worker task if still running
+        // We cannot .await here. Prefer to detach a join in the background
+        // so the worker can exit cleanly without being aborted.
         if let Some(join) = self.join.take() {
-            join.abort();
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn(async move {
+                        // Ignore result: Drop cannot surface it. This is only to avoid leaks.
+                        let _ = join.await;
+                    });
+                }
+                Err(_) => {
+                    // No Tokio runtime available (dropping outside async context).
+                    // Fall back to abort to avoid a potentially unbounded leaked task.
+                    tracing::debug!(
+                        "dropping ReplicationClient outside a Tokio runtime; aborting worker task"
+                    );
+                    join.abort();
+                }
+            }
         }
     }
 }
