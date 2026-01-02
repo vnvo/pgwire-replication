@@ -33,7 +33,6 @@ tls-rustls = [
 ]
 scram = ["dep:base64", "dep:hmac", "dep:sha2", "dep:rand"]
 md5 = ["dep:md5"]
-pgoutput = []
 integration-tests = [
     "dep:testcontainers",
     "dep:tokio-postgres",
