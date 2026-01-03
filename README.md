@@ -39,7 +39,7 @@ pgwire-replication = { version = "0.1", default-features = false, features = ["t
 
 ## Requirements
 
-- Rust 1.75 or later
+- Rust 1.88 or later
 - PostgreSQL 15+ with logical replication enabled (older versions will probably work too)
 
 ## Features
@@ -183,6 +183,15 @@ Dropping `ReplicationClient` requests a best-effort graceful stop. When dropped 
 
 Today, bounded replay is evaluated using WAL positions observed during streaming.
 Future versions may expose commit-boundary LSNs derived from pgoutput decoding for stronger replay guarantees.
+LSNs are formatted exactly as PostgreSQL displays them:
+
+- uppercase hexadecimal
+- `X/Y` format
+- up to 8 hex digits per part
+- leading zeros omitted
+
+Examples: `0/0`, `0/16B6C50`, `16/B374D848`
+Parsing accepts both padded and unpadded forms for compatibility.
 
 ## TLS support
 

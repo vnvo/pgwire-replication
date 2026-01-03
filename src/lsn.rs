@@ -1,8 +1,9 @@
 //! PostgreSQL Log Sequence Number (LSN) type.
 //!
-//! LSN is a 64-bit value representing a position in the write-ahead log.
-//! PostgreSQL displays LSNs in the format `XXXXXXXX/YYYYYYYY` where both
-//! parts are hexadecimal.
+//! PostgreSQL displays LSNs as `X/Y` (uppercase hex), where:
+//! - `X` is the high 32 bits
+//! - `Y` is the low 32 bits
+//! Each part is up to 8 hex digits; leading zeros are typically omitted.
 
 use std::fmt;
 use std::str::FromStr;
@@ -64,13 +65,13 @@ impl Lsn {
         let lo = u64::from_str_radix(lo_str, 16)
             .map_err(|_| ParseLsnError(format!("invalid low part '{lo_str}': {s}")))?;
 
-        Ok(Lsn((hi << 32) | lo))
+        Ok(Lsn(((hi as u64) << 32) | (lo as u64)))
     }
 
     /// Format as PostgreSQL's `XXXXXXXX/YYYYYYYY` string.
     #[inline]
     pub fn to_pg_string(self) -> String {
-        format!("{:X}/{:X}", (self.0 >> 32) as u32, self.0 as u32)
+        self.to_string()
     }
 
     /// Returns `true` if this is the zero LSN.
@@ -94,7 +95,10 @@ impl Lsn {
 
 impl fmt::Display for Lsn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:X}/{:X}", (self.0 >> 32) as u32, self.0 as u32)
+        let v: u64 = self.as_u64();
+        let hi = (v >> 32) as u32;
+        let lo = (v & 0xFFFF_FFFF) as u32;
+        write!(f, "{:X}/{:X}", hi, lo)
     }
 }
 
