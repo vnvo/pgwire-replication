@@ -83,10 +83,13 @@ tokio-postgres = "0.7"
 
 criterion = { version = "0.5", features = ["html_reports"] }
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [[bench]]
 name = "protocol_bench"
 harness = false
-
 
 [[example]]
 name = "with_tls"
@@ -97,3 +100,4 @@ required-features = ["tls-rustls"]
 name = "with_mtls"
 path = "examples/with_mtls.rs"
 required-features = ["tls-rustls"]
+
