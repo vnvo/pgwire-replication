@@ -5,10 +5,12 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use std::sync::Arc;
+
 #[cfg(not(feature = "tls-rustls"))]
 use crate::config::SslMode;
 
-use super::worker::{ReplicationEvent, ReplicationEventReceiver, WorkerState};
+use super::worker::{ReplicationEvent, ReplicationEventReceiver, SharedProgress, WorkerState};
 
 /// PostgreSQL logical replication client.
 ///
@@ -56,14 +58,9 @@ use super::worker::{ReplicationEvent, ReplicationEventReceiver, WorkerState};
 ///     // user-defined
 /// }
 /// ```
-///
-/// # Shutdown
-///
-/// The client can be stopped gracefully by calling [`stop()`](Self::stop),
-/// or it will be stopped automatically when dropped.
 pub struct ReplicationClient {
     rx: ReplicationEventReceiver,
-    applied_tx: watch::Sender<Lsn>,
+    progress: Arc<SharedProgress>,
     stop_tx: watch::Sender<bool>,
     join: Option<JoinHandle<std::result::Result<(), PgWireError>>>,
 }
@@ -85,11 +82,17 @@ impl ReplicationClient {
     /// - Publication doesn't exist
     pub async fn connect(cfg: ReplicationConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel(cfg.buffer_events);
-        let (applied_tx, applied_rx) = watch::channel(cfg.start_lsn);
+
+        // Progress is shared via atomics: cheap, monotonic, no async backpressure.
+        let progress = Arc::new(SharedProgress::new(cfg.start_lsn));
+
         let (stop_tx, stop_rx) = watch::channel(false);
 
+        let progress_for_worker = Arc::clone(&progress);
+        let cfg_for_worker = cfg.clone();
+
         let join = tokio::spawn(async move {
-            let mut worker = WorkerState::new(cfg.clone(), applied_rx, stop_rx, tx);
+            let mut worker = WorkerState::new(cfg_for_worker, progress_for_worker, stop_rx, tx);
             let res = run_worker(&mut worker, &cfg).await;
             if let Err(ref e) = res {
                 tracing::error!("replication worker terminated with error: {e}");
@@ -99,7 +102,7 @@ impl ReplicationClient {
 
         Ok(Self {
             rx,
-            applied_tx,
+            progress,
             stop_tx,
             join: Some(join),
         })
@@ -110,12 +113,6 @@ impl ReplicationClient {
     /// - `Ok(Some(event))` => received an event
     /// - `Ok(None)`        => replication ended normally (stop requested or stop_at_lsn reached)
     /// - `Err(e)`          => replication ended abnormally
-    ///
-    /// # Errors
-    ///
-    /// - Server errors (e.g., slot dropped, connection lost)
-    /// - Protocol errors
-    /// - Worker panic
     pub async fn recv(&mut self) -> Result<Option<ReplicationEvent>> {
         match self.rx.recv().await {
             Some(Ok(ev)) => Ok(Some(ev)),
@@ -124,7 +121,6 @@ impl ReplicationClient {
         }
     }
 
-    /// Handle the case where the worker channel is closed.
     async fn handle_worker_shutdown(&mut self) -> Result<Option<ReplicationEvent>> {
         let join = self
             .join
@@ -132,7 +128,7 @@ impl ReplicationClient {
             .ok_or_else(|| PgWireError::Internal("replication worker already joined".into()))?;
 
         match join.await {
-            Ok(Ok(())) => Ok(None), // clean exit => end of stream
+            Ok(Ok(())) => Ok(None),
             Ok(Err(e)) => Err(e),
             Err(join_err) => Err(PgWireError::Task(format!(
                 "replication worker panicked: {join_err}"
@@ -140,20 +136,14 @@ impl ReplicationClient {
         }
     }
 
-    /// Update the applied/committed LSN reported to the server.
+    /// Update the applied/durable LSN reported to the server.
     ///
-    /// This LSN is sent to PostgreSQL in periodic status updates, allowing
-    /// the server to release WAL segments. Call this after successfully
-    /// processing and persisting events (e.g., at transaction commit boundaries).
-    ///
-    /// # Note
-    ///
-    /// The update is asynchronous - the next status update will include this LSN.
-    /// Status updates are sent at the interval configured in `status_interval`.
+    /// Semantics: call this only once you have durably persisted all events up to `lsn`.
+    /// This update is monotonic and cheap; wire feedback is still governed by the worker’s
+    /// `status_interval` and keepalive reply requests.
     #[inline]
     pub fn update_applied_lsn(&self, lsn: Lsn) {
-        // Ignore send errors - worker may have stopped
-        let _ = self.applied_tx.send(lsn);
+        self.progress.update_applied(lsn);
     }
 
     /// Request the worker to stop gracefully.
@@ -168,7 +158,6 @@ impl ReplicationClient {
         let _ = self.stop_tx.send(true);
     }
 
-    /// Returns `true` if the worker task is still running.
     pub fn is_running(&self) -> bool {
         self.join
             .as_ref()
@@ -209,34 +198,30 @@ impl ReplicationClient {
         // Drain events until the worker closes the channel.
         while let Some(msg) = self.rx.recv().await {
             match msg {
-                Ok(_ev) => {
-                    // discard; caller can drain themselves if they need events
-                }
+                Ok(_ev) => {} //discard; caller can drain themselves if they need events
                 Err(e) => return Err(e),
             }
         }
 
-        // Now await the worker result (and surface panics/errors).
         self.join_mut().await
     }
 
     /// Wait for the worker task to complete and return its result.
-    pub async fn join_mut(&mut self) -> Result<()> {
+    async fn join_mut(&mut self) -> Result<()> {
         let join = self
             .join
             .take()
             .ok_or_else(|| PgWireError::Task("worker already joined".into()))?;
 
         match join.await {
-            Ok(inner) => inner,
-            Err(e) => Err(PgWireError::Task(format!("join error: {e}"))),
+            Ok(inner) => inner.map_err(Into::into),
+            Err(e) => Err(PgWireError::Task(format!("join error: {e}")).into()),
         }
     }
 }
 
 impl Drop for ReplicationClient {
     fn drop(&mut self) {
-        // Best-effort graceful stop.
         let _ = self.stop_tx.send(true);
 
         // We cannot .await here. Prefer to detach a join in the background
@@ -245,7 +230,6 @@ impl Drop for ReplicationClient {
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
                     handle.spawn(async move {
-                        // Ignore result: Drop cannot surface it. This is only to avoid leaks.
                         let _ = join.await;
                     });
                 }
@@ -262,7 +246,6 @@ impl Drop for ReplicationClient {
     }
 }
 
-/// Run the replication worker on a connection.
 async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result<()> {
     let tcp = TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
     tcp.set_nodelay(true)?;

@@ -148,6 +148,7 @@ Instead, the consumer explicitly reports progress:
 ```rust
 repl.update_applied_lsn(lsn);
 ```
+Calling `update_applied_lsn` indicates that **all WAL up to `lsn` has been durably persisted by the consumer** (for example, flushed to disk or a message queue).
 
 This allows callers to control:
 
@@ -155,7 +156,10 @@ This allows callers to control:
 - batching behavior
 - exactly-once or at-least-once semantics (implemented externally)
 
-Standby status updates are sent periodically using the latest applied LSN.
+Updates are **monotonic**: reporting an older LSN is a no-op.
+Standby status updates are sent asynchronously by the worker using the
+latest applied LSN, based on `status_interval` or server keepalive requests.
+For CDC pipelines, progress should typically be reported at **transaction commit boundaries**, not for every message.
 
 ## Idle behavior
 

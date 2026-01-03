@@ -1,4 +1,6 @@
 use bytes::Bytes;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
@@ -14,6 +16,45 @@ use crate::protocol::messages::{parse_auth_request, parse_error_response};
 use crate::protocol::replication::{
     encode_standby_status_update, parse_copy_data, ReplicationCopyData, PG_EPOCH_MICROS,
 };
+
+/// Shared replication progress updated by the consumer and read by the worker.
+///
+/// Stored as an AtomicU64 so progress updates are cheap and monotonic
+/// without async backpressure.
+pub struct SharedProgress {
+    applied: AtomicU64,
+}
+
+impl SharedProgress {
+    pub fn new(start: Lsn) -> Self {
+        Self {
+            applied: AtomicU64::new(start.as_u64()),
+        }
+    }
+
+    #[inline]
+    pub fn load_applied(&self) -> Lsn {
+        Lsn::from_u64(self.applied.load(Ordering::Acquire))
+    }
+
+    /// Monotonic update: if `lsn` is lower than the currently stored applied LSN,
+    /// this is a no-op.
+    #[inline]
+    pub fn update_applied(&self, lsn: Lsn) {
+        let new = lsn.as_u64();
+        let mut cur = self.applied.load(Ordering::Relaxed);
+
+        while new > cur {
+            match self
+                .applied
+                .compare_exchange_weak(cur, new, Ordering::Release, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+}
 
 /// Events emitted by the replication worker.
 #[derive(Debug, Clone)]
@@ -71,7 +112,7 @@ pub type ReplicationEventReceiver =
 /// Internal worker state.
 pub struct WorkerState {
     cfg: ReplicationConfig,
-    applied_rx: watch::Receiver<Lsn>,
+    progress: Arc<SharedProgress>,
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
 }
@@ -79,13 +120,13 @@ pub struct WorkerState {
 impl WorkerState {
     pub fn new(
         cfg: ReplicationConfig,
-        applied_rx: watch::Receiver<Lsn>,
+        progress: Arc<SharedProgress>,
         stop_rx: watch::Receiver<bool>,
         out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
     ) -> Self {
         Self {
             cfg,
-            applied_rx,
+            progress,
             stop_rx,
             out,
         }
@@ -145,7 +186,7 @@ impl WorkerState {
         stream: &mut S,
     ) -> Result<()> {
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
-        let mut last_applied = *self.applied_rx.borrow();
+        let mut last_applied = self.progress.load_applied();
 
         loop {
             // Check for stop request
@@ -155,7 +196,7 @@ impl WorkerState {
             }
 
             // Update applied LSN from client
-            let current_applied = *self.applied_rx.borrow();
+            let current_applied = self.progress.load_applied();
             if current_applied != last_applied {
                 last_applied = current_applied;
             }
@@ -175,8 +216,11 @@ impl WorkerState {
             {
                 Ok(res) => res?, // read_backend_message result
                 Err(_) => {
-                    // No message received in idle_timeout; keep the connection alive by sending feedback
-                    self.send_feedback(stream, last_applied, false).await?;
+                    // No message received; keep the connection alive by sending feedback
+                    // wakeup: send feedback even while idle
+                    let applied = self.progress.load_applied();
+                    last_applied = applied;
+                    self.send_feedback(stream, applied, false).await?;
                     last_status_sent = Instant::now();
                     continue;
                 }
@@ -225,7 +269,9 @@ impl WorkerState {
             } => {
                 // Respond immediately if server requests it
                 if reply_requested {
-                    self.send_feedback(stream, *last_applied, true).await?;
+                    let applied = self.progress.load_applied();
+                    *last_applied = applied;
+                    self.send_feedback(stream, applied, true).await?;
                     *last_status_sent = Instant::now();
                 }
 
@@ -244,7 +290,6 @@ impl WorkerState {
                 server_time_micros,
                 data,
             } => {
-
                 // If the payload is a pgoutput Begin/Commit message, emit only the boundary event.
                 if let Some(boundary_ev) = parse_pgoutput_boundary(&data)? {
                     let reached_lsn = match boundary_ev {
@@ -258,10 +303,12 @@ impl WorkerState {
                     // Stop condition (prefer boundary LSN semantics when available)
                     if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                         if reached_lsn >= stop_lsn {
-                            self.send_event(Ok(ReplicationEvent::StoppedAt { reached: reached_lsn }))
-                                .await;
+                            self.send_event(Ok(ReplicationEvent::StoppedAt {
+                                reached: reached_lsn,
+                            }))
+                            .await;
                             let _ = write_copy_done(stream).await;
-                            return Ok(true);
+                            return Ok(true); // should stop.
                         }
                     }
 
@@ -518,7 +565,6 @@ fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
         _ => Ok(None),
     }
 }
-
 
 /// Read authentication response data for a specific auth code.
 async fn read_auth_data<S: AsyncRead + AsyncWrite + Unpin>(
