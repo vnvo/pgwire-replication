@@ -9,6 +9,7 @@ authors = ["Vahid Negahdari <vahid.negahdari@gmail.com>"]
 description = "Tokio-based Postgres wire-protocol logical replication client (pgoutput) with TLS and SCRAM."
 keywords = [
     "postgres",
+    "pgoutput",
     "replication",
     "logical-replication",
     "wal",
