@@ -39,6 +39,12 @@
 //!             println!("Keepalive at {}", wal_end);
 //!         }
 //!         ReplicationEvent::StoppedAt {reached: _} => break,
+//!         ReplicationEvent::Begin { .. } => println!(
+//!             "Transaction start, probably want to flush in-flight events to the sinks."
+//!         ),
+//!         ReplicationEvent::Commit { .. } => println!(
+//!             "Transanction finished, good time to store a checkpoint at the higher level."
+//!         ),
 //!     }
 //! }
 //! # Ok(())

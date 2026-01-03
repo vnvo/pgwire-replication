@@ -266,6 +266,11 @@ async fn recv_until_xlog(
                 keepalives += 1;
                 debug!("received KeepAlive wal_end={wal_end} reply_requested={reply_requested}");
             }
+            ReplicationEvent::Begin { .. } => {}
+            ReplicationEvent::Commit { end_lsn, .. } => {
+                // Commit boundary; safe to advance (best-effort) while waiting for data
+                client.update_applied_lsn(end_lsn);
+            }
             ReplicationEvent::StoppedAt { reached } => {
                 anyhow::bail!("stopped unexpectedly at {reached} without observing XLogData");
             }
@@ -279,12 +284,12 @@ async fn recv_until_xlog(
 /// Returns count of XLogData events received.
 async fn drain_xlog_events(
     client: &mut ReplicationClient,
-    idle_timeout: Duration,
+    idle_wakeup_interval: Duration,
 ) -> Result<usize> {
     let mut count = 0usize;
 
     loop {
-        match tokio::time::timeout(idle_timeout, client.recv()).await {
+        match tokio::time::timeout(idle_wakeup_interval, client.recv()).await {
             Ok(Ok(Some(ReplicationEvent::XLogData { wal_end, .. }))) => {
                 client.update_applied_lsn(wal_end);
                 count += 1;
@@ -293,8 +298,12 @@ async fn drain_xlog_events(
                 // Idle - we've caught up
                 break;
             }
+            Ok(Ok(Some(ReplicationEvent::Begin { .. }))) => {}
+            Ok(Ok(Some(ReplicationEvent::Commit { end_lsn, .. }))) => {
+                client.update_applied_lsn(end_lsn);
+            }
             Ok(Ok(Some(ReplicationEvent::StoppedAt { .. }))) => break,
-            Ok(Ok(None)) => break, // stream ended cleanly
+            Ok(Ok(None)) => break, // stream ended
             Ok(Err(e)) => return Err(e.into()),
             Err(_) => break, // timeout - assume caught up
         }
@@ -315,6 +324,10 @@ async fn recv_keepalive(client: &mut ReplicationClient, timeout: Duration) -> Re
             ReplicationEvent::XLogData { wal_end, .. } => {
                 client.update_applied_lsn(wal_end);
             }
+            ReplicationEvent::Begin { .. } => {}
+            ReplicationEvent::Commit { end_lsn, .. } => {
+                client.update_applied_lsn(end_lsn);
+            }
             ReplicationEvent::StoppedAt { reached } => {
                 anyhow::bail!("stopped unexpectedly at {reached}")
             }
@@ -333,6 +346,8 @@ async fn recv_stopped_at(client: &mut ReplicationClient, timeout: Duration) -> R
         match ev {
             ReplicationEvent::StoppedAt { reached } => return Ok(reached),
             ReplicationEvent::XLogData { wal_end, .. } => client.update_applied_lsn(wal_end),
+            ReplicationEvent::Begin { .. } => {}
+            ReplicationEvent::Commit { end_lsn, .. } => client.update_applied_lsn(end_lsn),
             ReplicationEvent::KeepAlive { wal_end, .. } => {
                 debug!("keepalive while waiting stop reached wal_end={wal_end}")
             }

@@ -123,6 +123,12 @@ pub async fn main() -> anyhow::Result<()> {
                     // break is optional; the stream should end shortly anyway
                     break;
                 }
+                ReplicationEvent::Begin { .. } => println!(
+                    "Transaction start, probably want to flush in-flight events to the sinks."
+                ),
+                ReplicationEvent::Commit { .. } => println!(
+                    "Transanction finished, good time to store a checkpoint at the higher level."
+                ),
             },
             Ok(None) => {
                 println!("Replication ended cleanly");

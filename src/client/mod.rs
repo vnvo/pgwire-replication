@@ -62,6 +62,7 @@
 //!                 println!("Reached stop LSN {}", reached);
 //!                 break;
 //!             }
+//!             _ => {}
 //!         }
 //!     }
 //!

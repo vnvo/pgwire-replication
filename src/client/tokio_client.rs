@@ -45,6 +45,7 @@ use super::worker::{ReplicationEvent, ReplicationEventReceiver, WorkerState};
 ///                 println!("Reached stop LSN: {reached}");
 ///                 break;
 ///             }
+///             _ => {}
 ///         }
 ///     }
 ///

@@ -28,6 +28,13 @@ pub enum ReplicationEvent {
         server_time_micros: i64,
     },
 
+    /// Start of a transaction (pgoutput Begin message).
+    Begin {
+        final_lsn: Lsn,
+        xid: u32,
+        commit_time_micros: i64,
+    },
+
     /// WAL data containing transaction changes.
     XLogData {
         /// WAL position where this data starts
@@ -38,6 +45,13 @@ pub enum ReplicationEvent {
         server_time_micros: i64,
         /// pgoutput-encoded change data
         data: Bytes,
+    },
+
+    /// End of a transaction (pgoutput Commit message).
+    Commit {
+        lsn: Lsn,
+        end_lsn: Lsn,
+        commit_time_micros: i64,
     },
 
     /// Emitted when `stop_at_lsn` has been reached.
@@ -230,6 +244,30 @@ impl WorkerState {
                 server_time_micros,
                 data,
             } => {
+
+                // If the payload is a pgoutput Begin/Commit message, emit only the boundary event.
+                if let Some(boundary_ev) = parse_pgoutput_boundary(&data)? {
+                    let reached_lsn = match boundary_ev {
+                        ReplicationEvent::Begin { final_lsn, .. } => final_lsn,
+                        ReplicationEvent::Commit { end_lsn, .. } => end_lsn,
+                        _ => wal_end, // should never happen if parser only returns Begin/Commit
+                    };
+
+                    self.send_event(Ok(boundary_ev)).await;
+
+                    // Stop condition (prefer boundary LSN semantics when available)
+                    if let Some(stop_lsn) = self.cfg.stop_at_lsn {
+                        if reached_lsn >= stop_lsn {
+                            self.send_event(Ok(ReplicationEvent::StoppedAt { reached: reached_lsn }))
+                                .await;
+                            let _ = write_copy_done(stream).await;
+                            return Ok(true);
+                        }
+                    }
+
+                    return Ok(false);
+                }
+                // Otherwise, emit raw payload
                 // Check stop condition
                 if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                     if wal_end >= stop_lsn {
@@ -417,6 +455,70 @@ fn parse_sasl_mechanisms(data: &[u8]) -> Vec<String> {
 
     mechanisms
 }
+
+fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    let tag = data[0];
+    let mut p = &data[1..];
+
+    fn take_i8(p: &mut &[u8]) -> Result<i8> {
+        if p.len() < 1 {
+            return Err(PgWireError::Protocol("pgoutput: truncated i8".into()));
+        }
+        let v = p[0] as i8;
+        *p = &p[1..];
+        Ok(v)
+    }
+
+    fn take_i32(p: &mut &[u8]) -> Result<i32> {
+        if p.len() < 4 {
+            return Err(PgWireError::Protocol("pgoutput: truncated i32".into()));
+        }
+        let (head, tail) = p.split_at(4);
+        *p = tail;
+        Ok(i32::from_be_bytes(head.try_into().unwrap()))
+    }
+
+    fn take_i64(p: &mut &[u8]) -> Result<i64> {
+        if p.len() < 8 {
+            return Err(PgWireError::Protocol("pgoutput: truncated i64".into()));
+        }
+        let (head, tail) = p.split_at(8);
+        *p = tail;
+        Ok(i64::from_be_bytes(head.try_into().unwrap()))
+    }
+
+    match tag {
+        b'B' => {
+            let final_lsn = Lsn::from_u64(take_i64(&mut p)? as u64);
+            let commit_time_micros = take_i64(&mut p)?;
+            let xid = take_i32(&mut p)? as u32;
+
+            Ok(Some(ReplicationEvent::Begin {
+                final_lsn,
+                commit_time_micros,
+                xid,
+            }))
+        }
+        b'C' => {
+            let _flags = take_i8(&mut p)?;
+            let lsn = Lsn::from_u64(take_i64(&mut p)? as u64); // should be safe
+            let end_lsn = Lsn::from_u64(take_i64(&mut p)? as u64);
+            let commit_time_micros = take_i64(&mut p)?;
+
+            Ok(Some(ReplicationEvent::Commit {
+                lsn,
+                end_lsn,
+                commit_time_micros,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 
 /// Read authentication response data for a specific auth code.
 async fn read_auth_data<S: AsyncRead + AsyncWrite + Unpin>(
