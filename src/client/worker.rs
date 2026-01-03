@@ -512,7 +512,7 @@ fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
     let mut p = &data[1..];
 
     fn take_i8(p: &mut &[u8]) -> Result<i8> {
-        if p.len() < 1 {
+        if p.is_empty() {
             return Err(PgWireError::Protocol("pgoutput: truncated i8".into()));
         }
         let v = p[0] as i8;

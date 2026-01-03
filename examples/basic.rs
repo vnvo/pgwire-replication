@@ -60,14 +60,10 @@ pub async fn main() -> anyhow::Result<()> {
                     println!("StoppedAt reached={reached}");
                     break;
                 }
-                ReplicationEvent::Begin {
-                    xid,
-                    ..
-                } => println!("Transaction started, xid={xid}"),
-                ReplicationEvent::Commit {
-                    end_lsn,
-                    ..
-                } => print!("Transaction finished, end_lsn={end_lsn}"),
+                ReplicationEvent::Begin { xid, .. } => println!("Transaction started, xid={xid}"),
+                ReplicationEvent::Commit { end_lsn, .. } => {
+                    print!("Transaction finished, end_lsn={end_lsn}")
+                }
             },
             Ok(None) => {
                 println!("Replication ended cleanly");

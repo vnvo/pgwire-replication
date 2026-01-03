@@ -214,8 +214,8 @@ impl ReplicationClient {
             .ok_or_else(|| PgWireError::Task("worker already joined".into()))?;
 
         match join.await {
-            Ok(inner) => inner.map_err(Into::into),
-            Err(e) => Err(PgWireError::Task(format!("join error: {e}")).into()),
+            Ok(inner) => inner,
+            Err(e) => Err(PgWireError::Task(format!("join error: {e}"))),
         }
     }
 }

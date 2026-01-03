@@ -3,6 +3,7 @@
 //! PostgreSQL displays LSNs as `X/Y` (uppercase hex), where:
 //! - `X` is the high 32 bits
 //! - `Y` is the low 32 bits
+//!
 //! Each part is up to 8 hex digits; leading zeros are typically omitted.
 
 use std::fmt;
@@ -65,7 +66,7 @@ impl Lsn {
         let lo = u64::from_str_radix(lo_str, 16)
             .map_err(|_| ParseLsnError(format!("invalid low part '{lo_str}': {s}")))?;
 
-        Ok(Lsn(((hi as u64) << 32) | (lo as u64)))
+        Ok(Lsn((hi << 32) | lo))
     }
 
     /// Format as PostgreSQL's `XXXXXXXX/YYYYYYYY` string.
