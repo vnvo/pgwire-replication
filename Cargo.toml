@@ -12,9 +12,7 @@ keywords = [
     "postgres",
     "pgoutput",
     "replication",
-    "logical-replication",
     "wal",
-    "cdc",
     "pgwire",
 ]
 categories = ["database", "network-programming", "asynchronous"]
