@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.1.1] - 2025-01-09
+
+### Fixed
+- `stop()` is now immediately responsive regardless of `idle_wakeup_interval`
+  - Previously, the worker only checked the stop signal at the top of the stream loop, meaning `stop()` could take up to `idle_wakeup_interval` to take effect if blocked waiting for Postgres messages
+  - Now uses `tokio::select!` to concurrently watch for stop signals while waiting, ensuring prompt shutdown
+
+---
+
 ## [0.1.0] - 2025-12-31
 
 ### Added
