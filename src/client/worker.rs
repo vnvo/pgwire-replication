@@ -189,12 +189,6 @@ impl WorkerState {
         let mut last_applied = self.progress.load_applied();
 
         loop {
-            // Check for stop request
-            if *self.stop_rx.borrow() {
-                let _ = write_copy_done(stream).await;
-                return Ok(());
-            }
-
             // Update applied LSN from client
             let current_applied = self.progress.load_applied();
             if current_applied != last_applied {
@@ -207,22 +201,36 @@ impl WorkerState {
                 last_status_sent = Instant::now();
             }
 
-            // Read next message with idle timeout
-            let msg = match tokio::time::timeout(
-                self.cfg.idle_wakeup_interval,
-                read_backend_message(stream),
-            )
-            .await
-            {
-                Ok(res) => res?, // read_backend_message result
-                Err(_) => {
-                    // No message received; keep the connection alive by sending feedback
-                    // wakeup: send feedback even while idle
-                    let applied = self.progress.load_applied();
-                    last_applied = applied;
-                    self.send_feedback(stream, applied, false).await?;
-                    last_status_sent = Instant::now();
+            // Use select! to check stop signal while waiting for messages.
+            // This makes stop immediately responsive instead of waiting up to
+            // idle_wakeup_interval.
+            let msg = tokio::select! {
+                biased; // Check stop first for immediate responsiveness
+
+                _ = self.stop_rx.changed() => {
+                    if *self.stop_rx.borrow() {
+                        let _ = write_copy_done(stream).await;
+                        return Ok(());
+                    }
+                    // Spurious wake or stop was reset to false; continue loop
                     continue;
+                }
+
+                msg_result = tokio::time::timeout(
+                    self.cfg.idle_wakeup_interval,
+                    read_backend_message(stream),
+                ) => {
+                    match msg_result {
+                        Ok(res) => res?, // read_backend_message result
+                        Err(_) => {
+                            // No message received; keep the connection alive by sending feedback
+                            let applied = self.progress.load_applied();
+                            last_applied = applied;
+                            self.send_feedback(stream, applied, false).await?;
+                            last_status_sent = Instant::now();
+                            continue;
+                        }
+                    }
                 }
             };
 
