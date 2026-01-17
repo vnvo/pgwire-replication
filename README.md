@@ -181,12 +181,16 @@ Dropping `ReplicationClient` requests a best-effort graceful stop. When dropped 
 
 ## Important Notes on LSN Semantics
 
-- PostgreSQL does not guarantee that every logical replication message advances the WAL end position.
-- Small or fast transactions may share the same WAL position.
-- LSNs should be treated as monotonic but not dense.
+PostgreSQL logical replication delivers complete, committed transactions in commit order. This has important implications for LSN handling:
 
-Today, bounded replay is evaluated using WAL positions observed during streaming.
-Future versions may expose commit-boundary LSNs derived from pgoutput decoding for stronger replay guarantees.
+- **Commit LSNs are strictly monotonically increasing** across the replication stream.
+- **Within a single transaction**, event LSNs are monotonically increasing.
+- **Across transactions**, event LSNs are *not* monotonic. Concurrent transactions interleave their writes in WAL, so a later transaction in the stream may contain events with lower LSNs than the previous transaction.
+- **The tuple `(commit_lsn, event_lsn)` provides a total ordering** suitable for checkpointing and replay.
+- **LSNs are not dense**: LSNs are byte offsets into the WAL, not sequential counters. Gaps between consecutive events are normal.
+
+For CDC pipelines, progress tracking should typically be based on commit boundaries rather than individual event LSNs.
+
 LSNs are formatted exactly as PostgreSQL displays them:
 
 - uppercase hexadecimal
@@ -195,6 +199,7 @@ LSNs are formatted exactly as PostgreSQL displays them:
 - leading zeros omitted
 
 Examples: `0/0`, `0/16B6C50`, `16/B374D848`
+
 Parsing accepts both padded and unpadded forms for compatibility.
 
 ## TLS support

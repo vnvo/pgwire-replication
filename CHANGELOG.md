@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.1.2] - 2025-01-17
+### Fixed
+- Corrected documentation on LSN monotonicity semantics (event LSNs are not monotonic across transactions; `(commit_lsn, event_lsn)` tuple provides total ordering)
+
+---
+
 ## [0.1.1] - 2025-01-09
 
 ### Fixed
@@ -46,5 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fuzz testing for pgwire framing
 
 
-[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.1.2
+[0.1.1]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.1.0
