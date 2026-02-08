@@ -95,6 +95,22 @@ pub enum ReplicationEvent {
         commit_time_micros: i64,
     },
 
+    /// Logical decoding message emitted via `pg_logical_emit_message()`.
+    ///
+    /// Transactional messages are delivered only after the enclosing
+    /// transaction commits. Non-transactional messages are delivered
+    /// immediately.
+    Message {
+        /// Whether the message was emitted inside a transaction.
+        transactional: bool,
+        /// LSN of the message in the WAL.
+        lsn: Lsn,
+        /// Application-defined message prefix (e.g. `"myapp.checkpoint"`).
+        prefix: String,
+        /// Raw message content bytes.
+        content: Bytes,
+    },
+
     /// Emitted when `stop_at_lsn` has been reached.
     ///
     /// After this event, no more events will be emitted and the
@@ -163,7 +179,8 @@ impl WorkerState {
         // Escape single quotes in publication name
         let publication = self.cfg.publication.replace('\'', "''");
         let sql = format!(
-            "START_REPLICATION SLOT {} LOGICAL {} (proto_version '1', publication_names '{}')",
+            "START_REPLICATION SLOT {} LOGICAL {} \
+            (proto_version '1', publication_names '{}', messages 'true')",
             self.cfg.slot, self.cfg.start_lsn, publication,
         );
         write_query(stream, &sql).await?;
@@ -568,6 +585,37 @@ fn parse_pgoutput_boundary(data: &Bytes) -> Result<Option<ReplicationEvent>> {
                 lsn,
                 end_lsn,
                 commit_time_micros,
+            }))
+        }
+        b'M' => {
+            // Logical decoding message (pg_logical_emit_message)
+            // Wire: flags(1) + lsn(8) + prefix(null-terminated) + content_len(4) + content(n)
+            let flags = take_i8(&mut p)?;
+            let transactional = (flags & 1) != 0;
+            let lsn = Lsn::from_u64(take_i64(&mut p)? as u64);
+
+            // Read null-terminated prefix string
+            let prefix_end = p.iter().position(|&b| b == 0).ok_or_else(|| {
+                PgWireError::Protocol("pgoutput Message: missing null terminator for prefix".into())
+            })?;
+            let prefix = String::from_utf8_lossy(&p[..prefix_end]).into_owned();
+            p = &p[prefix_end + 1..]; // advance past null byte
+
+            let content_len = take_i32(&mut p)? as usize;
+            if p.len() < content_len {
+                return Err(PgWireError::Protocol(format!(
+                    "pgoutput Message: expected {} content bytes, got {}",
+                    content_len,
+                    p.len()
+                )));
+            }
+            let content = Bytes::copy_from_slice(&p[..content_len]);
+
+            Ok(Some(ReplicationEvent::Message {
+                transactional,
+                lsn,
+                prefix,
+                content,
             }))
         }
         _ => Ok(None),

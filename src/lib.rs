@@ -38,6 +38,9 @@
 //!         ReplicationEvent::KeepAlive { wal_end, .. } => {
 //!             println!("Keepalive at {}", wal_end);
 //!         }
+//!         ReplicationEvent::Message { prefix, content, .. } => println!(
+//!             "Logical message: prefix={}, {} bytes", prefix, content.len()
+//!         ),
 //!         ReplicationEvent::StoppedAt {reached: _} => break,
 //!         ReplicationEvent::Begin { .. } => println!(
 //!             "Transaction start, probably want to flush in-flight events to the sinks."

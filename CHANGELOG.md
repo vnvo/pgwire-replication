@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- Support for `pg_logical_emit_message()` via new `ReplicationEvent::Message` variant
+  - Messages are always enabled (`messages 'true'` in pgoutput protocol options); zero overhead when unused
+  - Both transactional and non-transactional messages are supported
+  - Events include `prefix` (application-defined string), `content` (raw bytes), `lsn`, and `transactional` flag
+
+### Changed
+- `START_REPLICATION` now includes `messages 'true'` in pgoutput options (previously only `proto_version` and `publication_names`)
+
+---
+
 ## [0.1.2] - 2025-01-17
 ### Fixed
 - Corrected documentation on LSN monotonicity semantics (event LSNs are not monotonic across transactions; `(commit_lsn, event_lsn)` tuple provides total ordering)

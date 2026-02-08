@@ -70,6 +70,9 @@ async fn main() -> anyhow::Result<()> {
                 ReplicationEvent::Commit { .. } => println!(
                     "Transanction finished, good time to store a checkpoint at the higher level."
                 ),
+                ReplicationEvent::Message { prefix, content, .. } => {
+                    println!("Message prefix={prefix:?} bytes={}", content.len());
+                }
             },
             Ok(None) => {
                 println!("Replication ended cleanly");

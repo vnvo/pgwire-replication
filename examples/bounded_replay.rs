@@ -84,6 +84,9 @@ pub async fn main() -> anyhow::Result<()> {
                 ReplicationEvent::Commit {
                     ..
                 } => print!("transaction commit."),
+                ReplicationEvent::Message { prefix, content, .. } => println!(
+                    "Logical message: prefix={}, {} bytes", prefix, content.len()
+                ),
             },
             Ok(None) => {
                 println!("Replication ended cleanly");

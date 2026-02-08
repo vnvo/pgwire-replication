@@ -47,6 +47,7 @@ pgwire-replication = { version = "0.1", default-features = false, features = ["t
 - Logical replication using the PostgreSQL wire protocol
 - `pgoutput` logical decoding support (transport-level)
 - Explicit LSN seek (`start_lsn`)
+- `pg_logical_emit_message()` support
 - Bounded replay (`stop_at_lsn`)
 - Periodic standby status updates
 - Keepalive handling
@@ -81,6 +82,10 @@ while let Some(event) = repl.recv().await? {
             repl.update_applied_lsn(wal_end);
         }
         ReplicationEvent::KeepAlive { .. } => {}
+        ReplicationEvent::Message { prefix, content, .. } => {
+            // User-defined message from pg_logical_emit_message()
+            handle_message(prefix, content);
+        }        
         ReplicationEvent::StoppedAt { reached } => break,
     }
 }
@@ -170,6 +175,37 @@ This is normal.
 waiting for server messages before waking up to send a standby status update and continue waiting.
 While the system is idle, the effective feedback cadence is bounded by
 `idle_wakeup_interval`, not `status_interval`.
+
+## Logical Decoding Messages
+
+PostgreSQL's `pg_logical_emit_message()` lets applications write custom messages
+into the WAL stream. These are surfaced as `ReplicationEvent::Message` events:
+```rust
+ReplicationEvent::Message {
+    transactional: bool,  // true if emitted inside a transaction
+    lsn: Lsn,            // WAL position of the message
+    prefix: String,       // application-defined prefix
+    content: Bytes,       // raw message payload
+}
+```
+
+Messages are always enabled in the pgoutput protocol options. There is no
+overhead when no messages are emitted — PostgreSQL simply never sends the `'M'`
+payload.
+
+**Non-transactional** messages (`SELECT pg_logical_emit_message(false, ...)`)
+are delivered immediately and are not tied to any transaction boundary.
+
+**Transactional** messages (`SELECT pg_logical_emit_message(true, ...)`)
+are delivered only after the enclosing transaction commits, appearing between
+`Begin` and `Commit` events.
+
+Use cases include:
+
+- application-level checkpoint markers
+- out-of-band coordination signals
+- schema migration fencing
+- custom CDC control messages
 
 ## Shutdown
 

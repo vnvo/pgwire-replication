@@ -271,6 +271,7 @@ async fn recv_until_xlog(
                 // Commit boundary; safe to advance (best-effort) while waiting for data
                 client.update_applied_lsn(end_lsn);
             }
+            ReplicationEvent::Message { .. } => {}
             ReplicationEvent::StoppedAt { reached } => {
                 anyhow::bail!("stopped unexpectedly at {reached} without observing XLogData");
             }
@@ -302,6 +303,7 @@ async fn drain_xlog_events(
             Ok(Ok(Some(ReplicationEvent::Commit { end_lsn, .. }))) => {
                 client.update_applied_lsn(end_lsn);
             }
+            Ok(Ok(Some(ReplicationEvent::Message { .. }))) => {}
             Ok(Ok(Some(ReplicationEvent::StoppedAt { .. }))) => break,
             Ok(Ok(None)) => break, // stream ended
             Ok(Err(e)) => return Err(e.into()),
@@ -328,6 +330,7 @@ async fn recv_keepalive(client: &mut ReplicationClient, timeout: Duration) -> Re
             ReplicationEvent::Commit { end_lsn, .. } => {
                 client.update_applied_lsn(end_lsn);
             }
+            ReplicationEvent::Message { .. } => {}
             ReplicationEvent::StoppedAt { reached } => {
                 anyhow::bail!("stopped unexpectedly at {reached}")
             }
@@ -346,6 +349,7 @@ async fn recv_stopped_at(client: &mut ReplicationClient, timeout: Duration) -> R
         match ev {
             ReplicationEvent::StoppedAt { reached } => return Ok(reached),
             ReplicationEvent::XLogData { wal_end, .. } => client.update_applied_lsn(wal_end),
+            ReplicationEvent::Message {..} => {},
             ReplicationEvent::Begin { .. } => {}
             ReplicationEvent::Commit { end_lsn, .. } => client.update_applied_lsn(end_lsn),
             ReplicationEvent::KeepAlive { wal_end, .. } => {
@@ -354,6 +358,36 @@ async fn recv_stopped_at(client: &mut ReplicationClient, timeout: Duration) -> R
         }
     }
     anyhow::bail!("timeout waiting for StoppedAt");
+}
+
+/// Receive events until a Message event arrives.
+async fn recv_until_message_event(
+    client: &mut ReplicationClient,
+    timeout: Duration,
+) -> Result<(String, Bytes, bool)> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let ev = client.recv().await.context("recv")?;
+        let Some(ev) = ev else {
+            anyhow::bail!("stream ended unexpectedly");
+        };
+        match ev {
+            ReplicationEvent::Message {
+                prefix,
+                content,
+                transactional,
+                ..
+            } => return Ok((prefix, content, transactional)),
+            ReplicationEvent::Commit { end_lsn, .. } => {
+                client.update_applied_lsn(end_lsn);
+            }
+            ReplicationEvent::XLogData { wal_end, .. } => {
+                client.update_applied_lsn(wal_end);
+            }
+            _ => {}
+        }
+    }
+    anyhow::bail!("timeout waiting for Message event");
 }
 
 // ============================================================================
@@ -716,6 +750,67 @@ async fn postgres_replication_multi_table() -> Result<()> {
     let _ = repl.join().await;
 
     info!("multi-table test completed successfully");
+    Ok(())
+}
+
+/// Test that `pg_logical_emit_message()` messages are received.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_logical_emit_message() -> Result<()> {
+    init_tracing();
+
+    let host_port: u16 = std::env::var("PG_ITEST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(get_available_port);
+
+    info!("starting postgres container on host port {host_port}");
+    let image = postgres_image(host_port);
+    let container = image.start().await.expect("start postgres");
+
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+    setup_publication_and_slot(&client, "slot_msg", "pub_msg").await?;
+    let base_lsn = current_wal_lsn(&client).await?;
+
+    let mut repl = ReplicationClient::connect(replication_config(
+        host_port, "slot_msg", "pub_msg", base_lsn, None,
+    ))
+    .await
+    .context("connect")?;
+
+    let _ = recv_keepalive(&mut repl, Duration::from_secs(10)).await?;
+
+    // Non-transactional message
+    client
+        .batch_execute("SELECT pg_logical_emit_message(false, 'test.ping', 'hello from pg');")
+        .await?;
+
+    let (prefix, content, transactional) =
+        recv_until_message_event(&mut repl, Duration::from_secs(10)).await?;
+    assert_eq!(prefix, "test.ping");
+    assert_eq!(&content[..], b"hello from pg");
+    assert!(!transactional);
+
+    // Transactional message inside a transaction with DML
+    client
+        .batch_execute(
+            "BEGIN;
+             INSERT INTO t(id, v) VALUES (100, 'msg_test');
+             SELECT pg_logical_emit_message(true, 'test.checkpoint', 'txn-marker');
+             COMMIT;",
+        )
+        .await?;
+
+    let (prefix, content, transactional) =
+        recv_until_message_event(&mut repl, Duration::from_secs(10)).await?;
+    assert_eq!(prefix, "test.checkpoint");
+    assert_eq!(&content[..], b"txn-marker");
+    assert!(transactional);
+
+    repl.stop();
+    let _ = repl.join().await;
+    info!("pg_logical_emit_message test passed");
     Ok(())
 }
 
