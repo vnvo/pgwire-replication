@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
-## [Unreleased]
+## [0.2.0] - 2026-02-08
 
 ### Added
 - Support for `pg_logical_emit_message()` via new `ReplicationEvent::Message` variant
@@ -15,8 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Both transactional and non-transactional messages are supported
   - Events include `prefix` (application-defined string), `content` (raw bytes), `lsn`, and `transactional` flag
 - Unix domain socket connections: set `host` to a socket directory path (e.g. `/var/run/postgresql`)
-- `ReplicationConfig::unix()` convenience constructor
-- `ReplicationConfig::is_unix_socket()` and `ReplicationConfig::unix_socket_path()` helpers
+  - Follows libpq convention: any `host` starting with `/` is treated as a socket directory
+  - Socket path is `{host}/.s.PGSQL.{port}`
+  - `ReplicationConfig::unix()` convenience constructor
+  - `ReplicationConfig::is_unix_socket()` and `ReplicationConfig::unix_socket_path()` helpers
 
 ### Changed
 - `START_REPLICATION` now includes `messages 'true'` in pgoutput options (previously only `proto_version` and `publication_names`)
@@ -68,7 +70,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fuzz testing for pgwire framing
 
 
-[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.2.0
 [0.1.2]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.1.2
 [0.1.1]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.1.1
 [0.1.0]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.1.0
