@@ -349,7 +349,7 @@ async fn recv_stopped_at(client: &mut ReplicationClient, timeout: Duration) -> R
         match ev {
             ReplicationEvent::StoppedAt { reached } => return Ok(reached),
             ReplicationEvent::XLogData { wal_end, .. } => client.update_applied_lsn(wal_end),
-            ReplicationEvent::Message {..} => {},
+            ReplicationEvent::Message { .. } => {}
             ReplicationEvent::Begin { .. } => {}
             ReplicationEvent::Commit { end_lsn, .. } => client.update_applied_lsn(end_lsn),
             ReplicationEvent::KeepAlive { wal_end, .. } => {

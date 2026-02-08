@@ -65,11 +65,15 @@ pub async fn main() -> anyhow::Result<()> {
                     print!("Transaction finished, end_lsn={end_lsn}")
                 }
                 ReplicationEvent::Message {
-                    transactional, prefix, content, lsn,
+                    transactional,
+                    prefix,
+                    content,
+                    lsn,
                 } => {
                     println!(
                         "Message lsn={lsn} transactional={transactional} \
-                         prefix={prefix:?} bytes={}", content.len()
+                         prefix={prefix:?} bytes={}",
+                        content.len()
                     );
                 }
             },

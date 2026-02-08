@@ -189,9 +189,7 @@ ReplicationEvent::Message {
 }
 ```
 
-Messages are always enabled in the pgoutput protocol options. There is no
-overhead when no messages are emitted — PostgreSQL simply never sends the `'M'`
-payload.
+NB: Messages are always enabled in the pgoutput protocol options.
 
 **Non-transactional** messages (`SELECT pg_logical_emit_message(false, ...)`)
 are delivered immediately and are not tied to any transaction boundary.
