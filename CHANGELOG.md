@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - Messages are always enabled (`messages 'true'` in pgoutput protocol options); zero overhead when unused
   - Both transactional and non-transactional messages are supported
   - Events include `prefix` (application-defined string), `content` (raw bytes), `lsn`, and `transactional` flag
+- Unix domain socket connections: set `host` to a socket directory path (e.g. `/var/run/postgresql`)
+- `ReplicationConfig::unix()` convenience constructor
+- `ReplicationConfig::is_unix_socket()` and `ReplicationConfig::unix_socket_path()` helpers
 
 ### Changed
 - `START_REPLICATION` now includes `messages 'true'` in pgoutput options (previously only `proto_version` and `publication_names`)

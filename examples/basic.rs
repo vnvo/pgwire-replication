@@ -12,6 +12,8 @@ fn env(name: &str, default: &str) -> String {
 
 #[tokio::main]
 pub async fn main() -> anyhow::Result<()> {
+    // If PGHOST starts with '/', connects via Unix socket.
+    // e.g. PGHOST=/var/run/postgresql
     let host = env("PGHOST", "127.0.0.1");
     let port: u16 = env("PGPORT", "5432").parse()?;
     let user = env("PGUSER", "postgres");

@@ -54,6 +54,7 @@ pgwire-replication = { version = "0.1", default-features = false, features = ["t
 - Tokio-based async client
 - SCRAM-SHA-256 and MD5 authentication
 - TLS/mTLS support (via rustls)
+- Unix domain socket connections (libpq-compatible: host starts with `/`)
 - Designed for checkpoint and replay-based systems
 
 ## Non-goals
@@ -204,6 +205,38 @@ Use cases include:
 - out-of-band coordination signals
 - schema migration fencing
 - custom CDC control messages
+
+## Unix Domain Sockets
+
+On Unix systems, `pgwire-replication` supports connecting via Unix domain sockets.
+Following libpq convention, set `host` to the socket directory path:
+```rust
+let config = ReplicationConfig::unix(
+    "/var/run/postgresql",  // socket directory
+    5432,                    // port (used to form .s.PGSQL.5432)
+    "replicator",
+    "secret",
+    "mydb",
+    "my_slot",
+    "my_pub",
+);
+```
+
+Or equivalently via struct initialization:
+```rust
+let config = ReplicationConfig {
+    host: "/var/run/postgresql".into(),
+    port: 5432,
+    tls: TlsConfig::disabled(),
+    ..Default::default()
+};
+```
+
+Any `host` starting with `/` is treated as a Unix socket directory.
+The actual socket file used is `{host}/.s.PGSQL.{port}`.
+
+TLS is not supported over Unix sockets (not needed). Requesting a TLS mode other 
+than `Disable` with a Unix socket host will return an error.
 
 ## Shutdown
 

@@ -372,6 +372,74 @@ impl ReplicationConfig {
         }
     }
 
+    /// Returns `true` if `host` refers to a Unix domain socket directory.
+    ///
+    /// Following libpq convention, a host starting with `/` is treated as
+    /// the directory containing the PostgreSQL Unix socket file.
+    #[inline]
+    pub fn is_unix_socket(&self) -> bool {
+        self.host.starts_with('/')
+    }
+
+    /// Returns the full Unix socket path: `{host}/.s.PGSQL.{port}`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `host` does not start with `/` (i.e. `is_unix_socket()` is false).
+    pub fn unix_socket_path(&self) -> std::path::PathBuf {
+        assert!(
+            self.is_unix_socket(),
+            "unix_socket_path() called but host is not a socket directory: {:?}",
+            self.host
+        );
+        std::path::Path::new(&self.host).join(format!(".s.PGSQL.{}", self.port))
+    }
+
+    /// Create a configuration for connecting via Unix domain socket.
+    ///
+    /// `socket_dir` is the directory containing the PostgreSQL socket file
+    /// (e.g. `/var/run/postgresql`). The actual socket path will be
+    /// `{socket_dir}/.s.PGSQL.{port}`.
+    ///
+    /// TLS is automatically disabled for Unix socket connections.
+    ///
+    /// # Example
+    /// ```
+    /// use pgwire_replication::config::ReplicationConfig;
+    ///
+    /// let config = ReplicationConfig::unix(
+    ///     "/var/run/postgresql",
+    ///     5432,
+    ///     "replicator",
+    ///     "secret",
+    ///     "mydb",
+    ///     "my_slot",
+    ///     "my_pub",
+    /// );
+    /// assert!(config.is_unix_socket());
+    /// ```
+    pub fn unix(
+        socket_dir: impl Into<String>,
+        port: u16,
+        user: impl Into<String>,
+        password: impl Into<String>,
+        database: impl Into<String>,
+        slot: impl Into<String>,
+        publication: impl Into<String>,
+    ) -> Self {
+        Self {
+            host: socket_dir.into(),
+            port,
+            user: user.into(),
+            password: password.into(),
+            database: database.into(),
+            tls: TlsConfig::disabled(),
+            slot: slot.into(),
+            publication: publication.into(),
+            ..Default::default()
+        }
+    }
+
     /// Set the server port.
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
@@ -418,9 +486,19 @@ impl ReplicationConfig {
     ///
     /// Useful for logging without exposing credentials.
     pub fn display_connection(&self) -> String {
-        format!(
-            "postgresql://{}:***@{}:{}/{}",
-            self.user, self.host, self.port, self.database
-        )
+        if self.is_unix_socket() {
+            format!(
+                "postgresql://{}:***@[{}]:{}/{}",
+                self.user,
+                self.unix_socket_path().display(),
+                self.port,
+                self.database
+            )
+        } else {
+            format!(
+                "postgresql://{}:***@{}:{}/{}",
+                self.user, self.host, self.port, self.database
+            )
+        }
     }
 }

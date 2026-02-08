@@ -1,7 +1,11 @@
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
+
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
+
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
@@ -80,6 +84,8 @@ impl ReplicationClient {
     /// - Authentication fails
     /// - Replication slot doesn't exist
     /// - Publication doesn't exist
+    /// - Unix socket does not exist (when host starts with `/`)
+    /// - TLS requested with Unix socket connection
     pub async fn connect(cfg: ReplicationConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel(cfg.buffer_events);
 
@@ -247,6 +253,25 @@ impl Drop for ReplicationClient {
 }
 
 async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result<()> {
+    #[cfg(unix)]
+    if cfg.is_unix_socket() {
+        if cfg.tls.mode.requires_tls() {
+            return Err(PgWireError::Tls(
+                "TLS is not supported over Unix domain sockets".into(),
+            ));
+        }
+
+        let path = cfg.unix_socket_path();
+        let mut stream = UnixStream::connect(&path).await.map_err(|e| {
+            PgWireError::Io(format!(
+                "failed to connect to Unix socket {}: {e}",
+                path.display()
+            ))
+        })?;
+
+        return worker.run_on_stream(&mut stream).await;
+    }
+
     let tcp = TcpStream::connect((cfg.host.as_str(), cfg.port)).await?;
     tcp.set_nodelay(true)?;
 
