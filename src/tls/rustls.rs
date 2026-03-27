@@ -50,8 +50,8 @@
 //! ```
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::{fs::File, io::BufReader, sync::Arc};
 
 use rustls::{ClientConfig, RootCertStore};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -289,25 +289,23 @@ fn build_root_store(tls: &TlsConfig) -> Result<RootCertStore> {
 
     if let Some(path) = &tls.ca_pem_path {
         // Load custom CA certificates
-        let f = File::open(path).map_err(|e| {
-            PgWireError::Tls(format!(
-                "TLS config error: failed to open CA PEM '{}': {e}",
-                path.display()
-            ))
-        })?;
-        let mut rd = BufReader::new(f);
+        use rustls::pki_types::pem::PemObject;
 
-        let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                PgWireError::Tls(format!(
-                    "TLS config error: failed to parse CA PEM '{}': {e}",
-                    path.display()
-                ))
-            })?
-            .into_iter()
-            .map(|c| c.into_owned())
-            .collect();
+        let certs: Vec<CertificateDer<'static>> =
+            CertificateDer::pem_file_iter(path)
+                .map_err(|e| {
+                    PgWireError::Tls(format!(
+                        "TLS config error: failed to open CA PEM '{}': {e}",
+                        path.display()
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    PgWireError::Tls(format!(
+                        "TLS config error: failed to parse CA PEM '{}': {e}",
+                        path.display()
+                    ))
+                })?;
 
         let (added, _ignored) = roots.add_parsable_certificates(certs);
         if added == 0 {
@@ -328,27 +326,24 @@ fn build_root_store(tls: &TlsConfig) -> Result<RootCertStore> {
 fn load_cert_chain(
     path: &std::path::Path,
 ) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::CertificateDer;
 
-    let f = File::open(path).map_err(|e| {
-        PgWireError::Tls(format!(
-            "TLS config error: failed to open client certificate '{}': {e}",
-            path.display()
-        ))
-    })?;
-    let mut rd = BufReader::new(f);
-
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut rd)
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            PgWireError::Tls(format!(
-                "TLS config error: failed to parse client certificate '{}': {e}",
-                path.display()
-            ))
-        })?
-        .into_iter()
-        .map(|c| c.into_owned())
-        .collect();
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(path)
+            .map_err(|e| {
+                PgWireError::Tls(format!(
+                    "TLS config error: failed to open client certificate '{}': {e}",
+                    path.display()
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                PgWireError::Tls(format!(
+                    "TLS config error: failed to parse client certificate '{}': {e}",
+                    path.display()
+                ))
+            })?;
 
     if certs.is_empty() {
         return Err(PgWireError::Tls(format!(
@@ -364,110 +359,16 @@ fn load_cert_chain(
 ///
 /// Supports PKCS#8, PKCS#1 (RSA), and SEC1 (EC) key formats.
 fn load_private_key(path: &std::path::Path) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    // Try PKCS#8 first (most common modern format)
-    if let Some(key) = try_load_pkcs8_key(path)? {
-        return Ok(key);
-    }
-
-    // Try RSA PKCS#1 format
-    if let Some(key) = try_load_rsa_key(path)? {
-        return Ok(key);
-    }
-
-    // Try EC SEC1 format
-    if let Some(key) = try_load_ec_key(path)? {
-        return Ok(key);
-    }
-
-    Err(PgWireError::Tls(format!(
-        "TLS config error: no private key found in '{}'. \
-         Supported formats: PKCS#8, PKCS#1 (RSA), SEC1 (EC)",
-        path.display()
-    )))
-}
-
-fn try_load_pkcs8_key(
-    path: &std::path::Path,
-) -> Result<Option<rustls::pki_types::PrivateKeyDer<'static>>> {
+    use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::PrivateKeyDer;
 
-    let f = File::open(path).map_err(|e| {
+    PrivateKeyDer::from_pem_file(path).map_err(|e| {
         PgWireError::Tls(format!(
-            "TLS config error: failed to open private key '{}': {e}",
+            "TLS config error: failed to load private key from '{}': {e}. \
+             Supported formats: PKCS#8, PKCS#1 (RSA), SEC1 (EC)",
             path.display()
         ))
-    })?;
-    let mut rd = BufReader::new(f);
-
-    let keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::pkcs8_private_keys(&mut rd)
-        .filter_map(|r| r.ok())
-        .map(PrivateKeyDer::from)
-        .collect();
-
-    match keys.len() {
-        0 => Ok(None),
-        1 => Ok(Some(keys.into_iter().next().unwrap())),
-        n => Err(PgWireError::Tls(format!(
-            "TLS config error: found {n} PKCS#8 keys in '{}', expected 1",
-            path.display()
-        ))),
-    }
-}
-
-fn try_load_rsa_key(
-    path: &std::path::Path,
-) -> Result<Option<rustls::pki_types::PrivateKeyDer<'static>>> {
-    use rustls::pki_types::PrivateKeyDer;
-
-    let f = File::open(path).map_err(|e| {
-        PgWireError::Tls(format!(
-            "TLS config error: failed to open private key '{}': {e}",
-            path.display()
-        ))
-    })?;
-    let mut rd = BufReader::new(f);
-
-    let keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::rsa_private_keys(&mut rd)
-        .filter_map(|r| r.ok())
-        .map(PrivateKeyDer::from)
-        .collect();
-
-    match keys.len() {
-        0 => Ok(None),
-        1 => Ok(Some(keys.into_iter().next().unwrap())),
-        n => Err(PgWireError::Tls(format!(
-            "TLS config error: found {n} RSA keys in '{}', expected 1",
-            path.display()
-        ))),
-    }
-}
-
-fn try_load_ec_key(
-    path: &std::path::Path,
-) -> Result<Option<rustls::pki_types::PrivateKeyDer<'static>>> {
-    use rustls::pki_types::PrivateKeyDer;
-
-    let f = File::open(path).map_err(|e| {
-        PgWireError::Tls(format!(
-            "TLS config error: failed to open private key '{}': {e}",
-            path.display()
-        ))
-    })?;
-    let mut rd = BufReader::new(f);
-
-    let keys: Vec<PrivateKeyDer<'static>> = rustls_pemfile::ec_private_keys(&mut rd)
-        .filter_map(|r| r.ok())
-        .map(PrivateKeyDer::from)
-        .collect();
-
-    match keys.len() {
-        0 => Ok(None),
-        1 => Ok(Some(keys.into_iter().next().unwrap())),
-        n => Err(PgWireError::Tls(format!(
-            "TLS config error: found {n} EC keys in '{}', expected 1",
-            path.display()
-        ))),
-    }
+    })
 }
 
 // ==================== Custom Certificate Verifiers ====================
@@ -661,7 +562,7 @@ mod tests {
         let f = NamedTempFile::new().unwrap();
 
         let err = load_private_key(f.path()).unwrap_err().to_string();
-        assert!(err.contains("no private key"));
+        assert!(err.contains("failed to load private key"));
     }
 
     #[test]

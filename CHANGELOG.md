@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Wrapped the replication stream in a 128KB `BufReader`, batching WAL messages into fewer `recv()` syscalls
   - Reduces syscall overhead significantly during backlog drain scenarios
 
+### Removed
+- Replaced `rustls-pemfile` dependency with `rustls-pki-types` PEM parsing (already in the dependency tree via `rustls`)
+  - Resolves RUSTSEC-2025-0134 (unmaintained crate)
+
 ---
 
 ## [0.2.0] - 2026-02-08
