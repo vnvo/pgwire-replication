@@ -8,6 +8,7 @@
 //! - TLS errors (handshake failure, certificate issues)
 //! - Task errors (worker panics, unexpected termination)
 
+use std::sync::Arc;
 use thiserror::Error;
 
 /// Error type for all pgwire-replication operations.
@@ -15,9 +16,10 @@ use thiserror::Error;
 pub enum PgWireError {
     /// I/O error (network, file system).
     ///
-    /// Note: `std::io::Error` is not `Clone`, so we store the message.
+    /// Wraps `std::io::Error` in an `Arc` to preserve `ErrorKind` while
+    /// keeping `PgWireError` `Clone`. Use `.kind()` via `Arc`'s `Deref`.
     #[error("io error: {0}")]
-    Io(String),
+    Io(Arc<std::io::Error>),
 
     /// Protocol error - malformed message or unexpected response.
     #[error("protocol error: {0}")]
@@ -80,10 +82,9 @@ impl PgWireError {
     }
 }
 
-// Manual From impl since io::Error isn't Clone
 impl From<std::io::Error> for PgWireError {
     fn from(err: std::io::Error) -> Self {
-        PgWireError::Io(err.to_string())
+        PgWireError::Io(Arc::new(err))
     }
 }
 
