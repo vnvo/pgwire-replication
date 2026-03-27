@@ -263,10 +263,10 @@ async fn run_worker(worker: &mut WorkerState, cfg: &ReplicationConfig) -> Result
 
         let path = cfg.unix_socket_path();
         let mut stream = UnixStream::connect(&path).await.map_err(|e| {
-            PgWireError::Io(format!(
-                "failed to connect to Unix socket {}: {e}",
-                path.display()
-            ))
+            PgWireError::Io(std::sync::Arc::new(std::io::Error::new(
+                e.kind(),
+                format!("failed to connect to Unix socket {}: {e}", path.display()),
+            )))
         })?;
 
         return worker.run_on_stream(&mut stream).await;
