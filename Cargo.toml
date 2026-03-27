@@ -65,7 +65,7 @@ sha2 = { version = "0.10", optional = true }
 rand = { version = "0.9", optional = true }
 md5 = { version = "0.7", optional = true }
 
-testcontainers = { version = "0.25", optional = true }
+testcontainers = { version = "0.27", optional = true }
 tokio-postgres = { version = "0.7", optional = true }
 tracing-subscriber = { version = "0.3", optional = true, features = [
     "env-filter",
