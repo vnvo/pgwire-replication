@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -153,10 +153,14 @@ impl WorkerState {
         &mut self,
         stream: &mut S,
     ) -> Result<()> {
-        self.startup(stream).await?;
-        self.authenticate(stream).await?;
-        self.start_replication(stream).await?;
-        self.stream_loop(stream).await
+        // Wrap in a 128KB read buffer to batch multiple WAL messages into fewer
+        // recv() syscalls. BufReader delegates AsyncWrite to the inner stream,
+        // so writes (standby status replies, etc.) are unaffected.
+        let mut stream = BufReader::with_capacity(128 * 1024, stream);
+        self.startup(&mut stream).await?;
+        self.authenticate(&mut stream).await?;
+        self.start_replication(&mut stream).await?;
+        self.stream_loop(&mut stream).await
     }
 
     /// Send startup message with replication parameters.
