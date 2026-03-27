@@ -291,21 +291,20 @@ fn build_root_store(tls: &TlsConfig) -> Result<RootCertStore> {
         // Load custom CA certificates
         use rustls::pki_types::pem::PemObject;
 
-        let certs: Vec<CertificateDer<'static>> =
-            CertificateDer::pem_file_iter(path)
-                .map_err(|e| {
-                    PgWireError::Tls(format!(
-                        "TLS config error: failed to open CA PEM '{}': {e}",
-                        path.display()
-                    ))
-                })?
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| {
-                    PgWireError::Tls(format!(
-                        "TLS config error: failed to parse CA PEM '{}': {e}",
-                        path.display()
-                    ))
-                })?;
+        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+            .map_err(|e| {
+                PgWireError::Tls(format!(
+                    "TLS config error: failed to open CA PEM '{}': {e}",
+                    path.display()
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                PgWireError::Tls(format!(
+                    "TLS config error: failed to parse CA PEM '{}': {e}",
+                    path.display()
+                ))
+            })?;
 
         let (added, _ignored) = roots.add_parsable_certificates(certs);
         if added == 0 {
@@ -329,21 +328,20 @@ fn load_cert_chain(
     use rustls::pki_types::pem::PemObject;
     use rustls::pki_types::CertificateDer;
 
-    let certs: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_file_iter(path)
-            .map_err(|e| {
-                PgWireError::Tls(format!(
-                    "TLS config error: failed to open client certificate '{}': {e}",
-                    path.display()
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| {
-                PgWireError::Tls(format!(
-                    "TLS config error: failed to parse client certificate '{}': {e}",
-                    path.display()
-                ))
-            })?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+        .map_err(|e| {
+            PgWireError::Tls(format!(
+                "TLS config error: failed to open client certificate '{}': {e}",
+                path.display()
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| {
+            PgWireError::Tls(format!(
+                "TLS config error: failed to parse client certificate '{}': {e}",
+                path.display()
+            ))
+        })?;
 
     if certs.is_empty() {
         return Err(PgWireError::Tls(format!(
