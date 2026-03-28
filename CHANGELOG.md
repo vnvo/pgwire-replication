@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.1] - 2026-03-28
+
+### Improved
+- **Drain-phase tight loop** in `stream_loop`: while the BufReader has buffered data, reads up to 256 messages without `select!`/timeout overhead, then falls back to the wait path only when the buffer is empty
+  - Eliminates per-message tokio timer registration/deregistration during burst reads
+- **Reusable read buffer** via `read_backend_message_into()`: reuses a `BytesMut` across messages instead of allocating a new `Vec` per WAL message
+  - Reduces allocator pressure during high-throughput streaming
+
+### Benchmarked
+- Postgres CDC backlog drain: **37K -> 48K events/s (+32%)** in DeltaForge on Docker (direct connection, batch=4000, kafka linger.ms=0)
+
+---
+
 ## [0.3.0] - 2026-03-27
 
 ### Changed
