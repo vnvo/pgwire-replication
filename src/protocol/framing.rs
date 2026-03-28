@@ -46,6 +46,14 @@ impl BackendMessage {
 }
 
 pub async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<BackendMessage> {
+    read_backend_message_into(rd, &mut BytesMut::new()).await
+}
+
+/// Read a backend message, reusing `buf` to avoid per-message allocation.
+pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
+    rd: &mut R,
+    buf: &mut BytesMut,
+) -> Result<BackendMessage> {
     let mut hdr = [0u8; 5];
     rd.read_exact(&mut hdr).await?;
     let tag = hdr[0];
@@ -65,11 +73,12 @@ pub async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<Ba
         )));
     }
 
-    let mut buf = vec![0u8; payload_len];
-    rd.read_exact(&mut buf).await?;
+    buf.clear();
+    buf.resize(payload_len, 0);
+    rd.read_exact(&mut buf[..]).await?;
     Ok(BackendMessage {
         tag,
-        payload: Bytes::from(buf),
+        payload: buf.split().freeze(),
     })
 }
 

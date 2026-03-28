@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -9,8 +9,8 @@ use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
 use crate::protocol::framing::{
-    read_backend_message, write_copy_data, write_copy_done, write_password_message, write_query,
-    write_startup_message,
+    read_backend_message, read_backend_message_into, write_copy_data, write_copy_done,
+    write_password_message, write_query, write_startup_message,
 };
 use crate::protocol::messages::{parse_auth_request, parse_error_response};
 use crate::protocol::replication::{
@@ -202,12 +202,23 @@ impl WorkerState {
     }
 
     /// Main replication streaming loop.
+    ///
+    /// Uses a two-phase approach for throughput:
+    /// 1. **Drain phase**: while the BufReader has buffered data, read messages
+    ///    in a tight loop without `select!` or timeout overhead.
+    /// 2. **Wait phase**: when the buffer is empty, fall back to `select!` with
+    ///    timeout + stop signal to handle idle keepalives and graceful shutdown.
     async fn stream_loop<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
-        stream: &mut S,
+        stream: &mut BufReader<S>,
     ) -> Result<()> {
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
         let mut last_applied = self.progress.load_applied();
+        // Reusable read buffer — avoids per-message allocation.
+        let mut read_buf = BytesMut::with_capacity(4096);
+        // How many messages to process in the tight loop before checking
+        // stop signal and sending periodic status feedback.
+        const DRAIN_BATCH: usize = 256;
 
         loop {
             // Update applied LSN from client
@@ -222,29 +233,63 @@ impl WorkerState {
                 last_status_sent = Instant::now();
             }
 
-            // Use select! to check stop signal while waiting for messages.
-            // This makes stop immediately responsive instead of waiting up to
-            // idle_wakeup_interval.
+            // ── Drain phase: tight loop while BufReader has buffered data ──
+            // The BufReader has a 128KB internal buffer. When the kernel delivers
+            // a large TCP segment, many WAL messages are available without syscalls.
+            // Read them in a tight loop to avoid select!/timeout overhead per message.
+            let mut drained = 0usize;
+            while stream.buffer().len() >= 5 && drained < DRAIN_BATCH {
+                let msg = read_backend_message_into(stream, &mut read_buf).await?;
+                drained += 1;
+                match msg.tag {
+                    b'd' => {
+                        if self
+                            .handle_copy_data(
+                                stream,
+                                msg.payload,
+                                &mut last_applied,
+                                &mut last_status_sent,
+                            )
+                            .await?
+                        {
+                            return Ok(());
+                        }
+                    }
+                    b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+                    _ => {}
+                }
+            }
+
+            // If we drained messages, loop back to check stop/status before
+            // potentially blocking on the next read.
+            if drained > 0 {
+                // Check stop signal without blocking
+                if self.stop_rx.has_changed().unwrap_or(false) && *self.stop_rx.borrow() {
+                    let _ = write_copy_done(stream).await;
+                    return Ok(());
+                }
+                continue;
+            }
+
+            // ── Wait phase: buffer empty, need to wait for socket data ──
             let msg = tokio::select! {
-                biased; // Check stop first for immediate responsiveness
+                biased;
 
                 _ = self.stop_rx.changed() => {
                     if *self.stop_rx.borrow() {
                         let _ = write_copy_done(stream).await;
                         return Ok(());
                     }
-                    // Spurious wake or stop was reset to false; continue loop
                     continue;
                 }
 
                 msg_result = tokio::time::timeout(
                     self.cfg.idle_wakeup_interval,
-                    read_backend_message(stream),
+                    read_backend_message_into(stream, &mut read_buf),
                 ) => {
                     match msg_result {
-                        Ok(res) => res?, // read_backend_message result
+                        Ok(res) => res?,
                         Err(_) => {
-                            // No message received; keep the connection alive by sending feedback
                             let applied = self.progress.load_applied();
                             last_applied = applied;
                             self.send_feedback(stream, applied, false).await?;
@@ -257,25 +302,20 @@ impl WorkerState {
 
             match msg.tag {
                 b'd' => {
-                    let should_stop = self
+                    if self
                         .handle_copy_data(
                             stream,
                             msg.payload,
                             &mut last_applied,
                             &mut last_status_sent,
                         )
-                        .await?;
-                    if should_stop {
+                        .await?
+                    {
                         return Ok(());
                     }
                 }
-                b'E' => {
-                    let err = PgWireError::Server(parse_error_response(&msg.payload));
-                    return Err(err);
-                }
-                _ => {
-                    // Unexpected in CopyBoth mode, but ignore gracefully
-                }
+                b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
+                _ => {}
             }
         }
     }
@@ -283,7 +323,7 @@ impl WorkerState {
     /// Handle a CopyData message. Returns true if we should stop.
     async fn handle_copy_data<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
-        stream: &mut S,
+        stream: &mut BufReader<S>,
         payload: Bytes,
         last_applied: &mut Lsn,
         last_status_sent: &mut Instant,
