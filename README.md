@@ -27,14 +27,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgwire-replication = "0.3.1"
+pgwire-replication = "0.3.2"
 ```
 
 Or with specific features:
 
 ```toml
 [dependencies]
-pgwire-replication = { version = "0.3.1", default-features = false, features = ["tls-rustls"] }
+pgwire-replication = { version = "0.3.2", default-features = false, features = ["tls-rustls"] }
 ```
 
 ## Requirements
