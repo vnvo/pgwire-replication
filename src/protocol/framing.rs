@@ -381,11 +381,8 @@ mod tests {
         // Deliver only the first 3 header bytes, then cancel.
         writer.write_all(&header[..3]).await.unwrap();
 
-        let timed_out = tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            reader.read(&mut rd),
-        )
-        .await;
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(20), reader.read(&mut rd)).await;
         assert!(
             timed_out.is_err(),
             "read must time out while waiting for remaining header bytes"
@@ -422,11 +419,8 @@ mod tests {
         writer.write_all(&header).await.unwrap();
         writer.write_all(&payload[..5]).await.unwrap();
 
-        let timed_out = tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            reader.read(&mut rd),
-        )
-        .await;
+        let timed_out =
+            tokio::time::timeout(std::time::Duration::from_millis(20), reader.read(&mut rd)).await;
         assert!(
             timed_out.is_err(),
             "read must time out while waiting for remaining payload bytes"

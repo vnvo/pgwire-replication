@@ -244,22 +244,20 @@ impl WorkerState {
             while stream.buffer().len() >= 5 && drained < DRAIN_BATCH {
                 let msg = reader.read(stream).await?;
                 drained += 1;
-                match msg.tag {
-                    b'd' => {
-                        if self
-                            .handle_copy_data(
-                                stream,
-                                msg.payload,
-                                &mut last_applied,
-                                &mut last_status_sent,
-                            )
-                            .await?
-                        {
-                            return Ok(());
-                        }
-                    }
-                    b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                    _ => {}
+                if msg.tag == b'E' {
+                    return Err(PgWireError::Server(parse_error_response(&msg.payload)));
+                }
+                if msg.tag == b'd'
+                    && self
+                        .handle_copy_data(
+                            stream,
+                            msg.payload,
+                            &mut last_applied,
+                            &mut last_status_sent,
+                        )
+                        .await?
+                {
+                    return Ok(());
                 }
             }
 
@@ -308,22 +306,20 @@ impl WorkerState {
                 }
             };
 
-            match msg.tag {
-                b'd' => {
-                    if self
-                        .handle_copy_data(
-                            stream,
-                            msg.payload,
-                            &mut last_applied,
-                            &mut last_status_sent,
-                        )
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                }
-                b'E' => return Err(PgWireError::Server(parse_error_response(&msg.payload))),
-                _ => {}
+            if msg.tag == b'E' {
+                return Err(PgWireError::Server(parse_error_response(&msg.payload)));
+            }
+            if msg.tag == b'd'
+                && self
+                    .handle_copy_data(
+                        stream,
+                        msg.payload,
+                        &mut last_applied,
+                        &mut last_status_sent,
+                    )
+                    .await?
+            {
+                return Ok(());
             }
         }
     }

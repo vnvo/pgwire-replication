@@ -137,9 +137,7 @@ fn bench_read_backend_message(c: &mut Criterion) {
                         let mut cur = Cursor::new(black_box(stream.as_slice()));
                         let mut buf = BytesMut::with_capacity(4096);
                         for _ in 0..COUNT {
-                            let _msg = read_backend_message_into(&mut cur, &mut buf)
-                                .await
-                                .unwrap();
+                            let _msg = read_backend_message_into(&mut cur, &mut buf).await.unwrap();
                         }
                     });
                 });
