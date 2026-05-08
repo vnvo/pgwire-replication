@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.3.2] - 2026-05-08
+
+### Fixed
+- **Cancellation-safe message reading** in `stream_loop` (issue #5)
+  - The wait-phase `tokio::select!` previously raced `stop_rx.changed()` and `tokio::time::timeout` against `read_backend_message_into`, whose internal `read_exact` calls are not cancellation-safe. If the timeout fired while a backend message was mid-flight, partially-read header/payload bytes were dropped along with the cancelled future, leaving the next iteration to mis-parse the wire stream - typically surfacing as a bogus `payload_len` followed by a hang or `Protocol` error
+  - New `MessageReader` externalizes partial-read state (header/payload counters, parsed tag/length) and uses one-shot `AsyncReadExt::read` so dropped futures never lose bytes; the next call resumes exactly where the previous one left off
+  - `stream_loop` now owns a single `MessageReader` reused across drain and wait phases
+
+### Notes
+- `read_backend_message_into` is retained for non-`select!` callers (startup, auth, replication-start) and is now documented as **not cancellation-safe**
+
+---
+
 ## [0.3.1] - 2026-03-28
 
 ### Improved
@@ -100,7 +113,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Fuzz testing for pgwire framing
 
 
-[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/vnvo/pgwire-replication/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/vnvo/pgwire-replication/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/vnvo/pgwire-replication/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/vnvo/pgwire-replication/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.2.0
 [0.1.2]: https://github.com/vnvo/pgwire-replication/releases/tag/v0.1.2

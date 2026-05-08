@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
@@ -9,8 +9,8 @@ use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
 use crate::protocol::framing::{
-    read_backend_message, read_backend_message_into, write_copy_data, write_copy_done,
-    write_password_message, write_query, write_startup_message,
+    read_backend_message, write_copy_data, write_copy_done, write_password_message, write_query,
+    write_startup_message, MessageReader,
 };
 use crate::protocol::messages::{parse_auth_request, parse_error_response};
 use crate::protocol::replication::{
@@ -208,14 +208,17 @@ impl WorkerState {
     ///    in a tight loop without `select!` or timeout overhead.
     /// 2. **Wait phase**: when the buffer is empty, fall back to `select!` with
     ///    timeout + stop signal to handle idle keepalives and graceful shutdown.
+    ///
+    /// Reads use [`MessageReader`], which preserves partial-read state across
+    /// dropped futures so the wait-phase `select!` is cancellation-safe.
     async fn stream_loop<S: AsyncRead + AsyncWrite + Unpin>(
         &mut self,
         stream: &mut BufReader<S>,
     ) -> Result<()> {
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
         let mut last_applied = self.progress.load_applied();
-        // Reusable read buffer — avoids per-message allocation.
-        let mut read_buf = BytesMut::with_capacity(4096);
+        // Cancellation-safe message reader, partial reads survive dropped futures.
+        let mut reader = MessageReader::new();
         // How many messages to process in the tight loop before checking
         // stop signal and sending periodic status feedback.
         const DRAIN_BATCH: usize = 256;
@@ -239,7 +242,7 @@ impl WorkerState {
             // Read them in a tight loop to avoid select!/timeout overhead per message.
             let mut drained = 0usize;
             while stream.buffer().len() >= 5 && drained < DRAIN_BATCH {
-                let msg = read_backend_message_into(stream, &mut read_buf).await?;
+                let msg = reader.read(stream).await?;
                 drained += 1;
                 match msg.tag {
                     b'd' => {
@@ -272,6 +275,11 @@ impl WorkerState {
             }
 
             // ── Wait phase: buffer empty, need to wait for socket data ──
+            //
+            // Both `stop_rx.changed()` and the timeout can drop the read future
+            // mid-message. `MessageReader::read` is cancellation-safe — partial
+            // header/payload state lives on `reader` and is preserved across the
+            // drop, so the next iteration resumes the read without losing bytes.
             let msg = tokio::select! {
                 biased;
 
@@ -285,7 +293,7 @@ impl WorkerState {
 
                 msg_result = tokio::time::timeout(
                     self.cfg.idle_wakeup_interval,
-                    read_backend_message_into(stream, &mut read_buf),
+                    reader.read(stream),
                 ) => {
                     match msg_result {
                         Ok(res) => res?,

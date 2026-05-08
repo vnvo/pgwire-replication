@@ -1,4 +1,5 @@
 use bytes::{BufMut, Bytes, BytesMut};
+use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{PgWireError, Result};
@@ -46,10 +47,131 @@ impl BackendMessage {
 }
 
 pub async fn read_backend_message<R: AsyncRead + Unpin>(rd: &mut R) -> Result<BackendMessage> {
-    read_backend_message_into(rd, &mut BytesMut::new()).await
+    let mut reader = MessageReader::new();
+    reader.read(rd).await
 }
 
-/// Read a backend message, reusing `buf` to avoid per-message allocation.
+/// Cancellation-safe backend message reader.
+///
+/// PostgreSQL backend messages span multiple `read` operations (5-byte header,
+/// then a variable payload). A naive implementation using `read_exact` is
+/// **not** cancellation-safe: if the future is dropped between reads (e.g. by
+/// `tokio::select!` or `tokio::time::timeout`), bytes already pulled from the
+/// underlying stream are lost and the next read mis-parses the wire stream.
+///
+/// `MessageReader` externalizes the partial-read state so it survives across
+/// dropped futures. Each call to [`read`](Self::read) uses one-shot
+/// `AsyncReadExt::read` (which **is** cancel-safe) and accumulates progress
+/// on `self`. If the returned future is dropped, no bytes are lost; the next
+/// invocation resumes from where the previous one left off.
+pub struct MessageReader {
+    hdr: [u8; 5],
+    hdr_filled: usize,
+    payload: BytesMut,
+    payload_filled: usize,
+    /// `Some` once the header has been fully read and parsed; reset to
+    /// `None` after each completed message.
+    payload_len: Option<usize>,
+    tag: u8,
+}
+
+impl MessageReader {
+    pub fn new() -> Self {
+        Self::with_capacity(4096)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            hdr: [0u8; 5],
+            hdr_filled: 0,
+            payload: BytesMut::with_capacity(capacity),
+            payload_filled: 0,
+            payload_len: None,
+            tag: 0,
+        }
+    }
+
+    /// Read the next complete backend message.
+    ///
+    /// Cancellation-safe: dropping the returned future preserves all progress
+    /// so far on `self`. Re-call to resume.
+    pub async fn read<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<BackendMessage> {
+        // Phase 1: fill the 5-byte header
+        while self.hdr_filled < 5 {
+            let n = rd.read(&mut self.hdr[self.hdr_filled..]).await?;
+            if n == 0 {
+                return Err(PgWireError::Io(std::sync::Arc::new(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF while reading backend message header",
+                ))));
+            }
+            self.hdr_filled += n;
+        }
+
+        // Phase 2: parse the header (idempotent — runs once per message)
+        if self.payload_len.is_none() {
+            let len = i32::from_be_bytes([self.hdr[1], self.hdr[2], self.hdr[3], self.hdr[4]]);
+
+            if len < 4 {
+                // Reset so the reader is reusable after a protocol error is
+                // surfaced (callers typically tear down on this anyway).
+                self.hdr_filled = 0;
+                return Err(PgWireError::Protocol(format!(
+                    "invalid backend message length: {len}"
+                )));
+            }
+
+            let payload_len = (len - 4) as usize;
+
+            if payload_len > MAX_MESSAGE_SIZE {
+                self.hdr_filled = 0;
+                return Err(PgWireError::Protocol(format!(
+                    "backend message too large: {payload_len} bytes (max {MAX_MESSAGE_SIZE})"
+                )));
+            }
+
+            self.tag = self.hdr[0];
+            self.payload.clear();
+            self.payload.resize(payload_len, 0);
+            self.payload_filled = 0;
+            self.payload_len = Some(payload_len);
+        }
+
+        let payload_len = self.payload_len.unwrap();
+
+        // Phase 3: fill the payload
+        while self.payload_filled < payload_len {
+            let n = rd.read(&mut self.payload[self.payload_filled..]).await?;
+            if n == 0 {
+                return Err(PgWireError::Io(std::sync::Arc::new(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF while reading backend message payload",
+                ))));
+            }
+            self.payload_filled += n;
+        }
+
+        // Phase 4: take payload, reset state for next message
+        let payload = self.payload.split().freeze();
+        let tag = self.tag;
+        self.hdr_filled = 0;
+        self.payload_len = None;
+        self.payload_filled = 0;
+
+        Ok(BackendMessage { tag, payload })
+    }
+}
+
+impl Default for MessageReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Read a single backend message, reusing the provided buffer.
+///
+/// **Not** cancellation-safe — see [`MessageReader`] for a cancel-safe
+/// alternative used in the streaming loop.
 pub async fn read_backend_message_into<R: AsyncRead + Unpin>(
     rd: &mut R,
     buf: &mut BytesMut,
@@ -175,6 +297,7 @@ pub async fn write_copy_done<W: AsyncWrite + Unpin>(wr: &mut W) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
     async fn read_backend_message_parses_valid_message() {
@@ -206,6 +329,124 @@ mod tests {
         let mut cursor = Cursor::new(&data[..]);
 
         let err = read_backend_message(&mut cursor).await.unwrap_err();
+        assert!(err.to_string().contains("invalid backend message length"));
+    }
+
+    #[tokio::test]
+    async fn message_reader_reads_complete_message() {
+        // Tag 'Z' (ReadyForQuery), length=5 (4 + 1 byte payload), payload='I'
+        let data = [b'Z', 0, 0, 0, 5, b'I'];
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new();
+        let msg = reader.read(&mut cursor).await.unwrap();
+        assert_eq!(msg.tag, b'Z');
+        assert_eq!(&msg.payload[..], b"I");
+    }
+
+    #[tokio::test]
+    async fn message_reader_reads_back_to_back_messages() {
+        // Two messages on one stream: ReadyForQuery + NoticeResponse w/ empty payload
+        let data = [b'Z', 0, 0, 0, 5, b'I', b'N', 0, 0, 0, 4];
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new();
+
+        let m1 = reader.read(&mut cursor).await.unwrap();
+        assert_eq!(m1.tag, b'Z');
+        assert_eq!(&m1.payload[..], b"I");
+
+        let m2 = reader.read(&mut cursor).await.unwrap();
+        assert_eq!(m2.tag, b'N');
+        assert!(m2.payload.is_empty());
+    }
+
+    /// Regression test for issue #5: reading a backend message must be
+    /// cancellation-safe so that `tokio::select!` / `tokio::time::timeout`
+    /// dropping the read future mid-message does not corrupt the stream.
+    ///
+    /// With the old `read_backend_message_into`, dropping the future after
+    /// 3 of 5 header bytes were consumed would lose those 3 bytes and
+    /// re-parse the next bytes as a new header, producing a bogus length
+    /// and a Protocol error (or worse, a silent desync).
+    #[tokio::test]
+    async fn message_reader_resumes_after_cancellation_mid_header() {
+        let (mut writer, mut rd) = tokio::io::duplex(64);
+        let mut reader = MessageReader::new();
+
+        // Tag 'd' (CopyData), length = 8 (4 + 4-byte payload), payload b"abcd"
+        let header = [b'd', 0, 0, 0, 8];
+        let payload = b"abcd";
+
+        // Deliver only the first 3 header bytes, then cancel.
+        writer.write_all(&header[..3]).await.unwrap();
+
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            reader.read(&mut rd),
+        )
+        .await;
+        assert!(
+            timed_out.is_err(),
+            "read must time out while waiting for remaining header bytes"
+        );
+
+        // Deliver the remaining bytes. A correct cancel-safe reader resumes
+        // and returns the original message intact.
+        writer.write_all(&header[3..]).await.unwrap();
+        writer.write_all(payload).await.unwrap();
+
+        let msg = reader.read(&mut rd).await.unwrap();
+        assert_eq!(msg.tag, b'd');
+        assert_eq!(&msg.payload[..], payload);
+    }
+
+    /// Ensures partial-payload cancellation also resumes correctly.
+    #[tokio::test]
+    async fn message_reader_resumes_after_cancellation_mid_payload() {
+        let (mut writer, mut rd) = tokio::io::duplex(64);
+        let mut reader = MessageReader::new();
+
+        // 16-byte payload to ensure we can split it.
+        let payload: [u8; 16] = std::array::from_fn(|i| i as u8);
+        let len = (4 + payload.len()) as i32;
+        let header = [
+            b'd',
+            (len >> 24) as u8,
+            (len >> 16) as u8,
+            (len >> 8) as u8,
+            len as u8,
+        ];
+
+        // Full header + first 5 bytes of payload, then cancel.
+        writer.write_all(&header).await.unwrap();
+        writer.write_all(&payload[..5]).await.unwrap();
+
+        let timed_out = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            reader.read(&mut rd),
+        )
+        .await;
+        assert!(
+            timed_out.is_err(),
+            "read must time out while waiting for remaining payload bytes"
+        );
+
+        // Deliver the rest.
+        writer.write_all(&payload[5..]).await.unwrap();
+
+        let msg = reader.read(&mut rd).await.unwrap();
+        assert_eq!(msg.tag, b'd');
+        assert_eq!(&msg.payload[..], &payload[..]);
+    }
+
+    #[tokio::test]
+    async fn message_reader_rejects_invalid_length() {
+        let data = [b'Z', 0, 0, 0, 3];
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new();
+        let err = reader.read(&mut cursor).await.unwrap_err();
         assert!(err.to_string().contains("invalid backend message length"));
     }
 
