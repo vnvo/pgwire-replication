@@ -67,7 +67,7 @@ pub async fn main() -> anyhow::Result<()> {
         },
 
         slot,
-        publication,
+        publication: publication.into(),
         start_lsn,
         stop_at_lsn: None,
 

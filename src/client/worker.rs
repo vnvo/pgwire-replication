@@ -180,12 +180,10 @@ impl WorkerState {
         &self,
         stream: &mut S,
     ) -> Result<()> {
-        // Escape single quotes in publication name
-        let publication = self.cfg.publication.replace('\'', "''");
         let sql = format!(
             "START_REPLICATION SLOT {} LOGICAL {} \
             (proto_version '1', publication_names '{}', messages 'true')",
-            self.cfg.slot, self.cfg.start_lsn, publication,
+            self.cfg.slot, self.cfg.start_lsn, self.cfg.publication,
         );
         write_query(stream, &sql).await?;
 

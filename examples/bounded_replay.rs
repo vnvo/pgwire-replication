@@ -45,7 +45,7 @@ pub async fn main() -> anyhow::Result<()> {
         database,
         tls: TlsConfig::disabled(),
         slot,
-        publication,
+        publication: publication.into(),
         start_lsn,
         stop_at_lsn: Some(stop_at_lsn),
 

@@ -214,6 +214,34 @@ impl TlsConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Publication(Vec<String>);
+
+impl From<&str> for Publication {
+    fn from(value: &str) -> Self {
+        Self(vec![value.into()])
+    }
+}
+
+impl From<String> for Publication {
+    fn from(value: String) -> Self {
+        Self(vec![value])
+    }
+}
+
+impl<A: Into<String>> FromIterator<A> for Publication {
+    fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
+        Self(iter.into_iter().map(|item| item.into()).collect())
+    }
+}
+
+impl std::fmt::Display for Publication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Escape single quotes in publication name
+        write!(f, "{}", self.0.join(",").replace('\'', "''"))
+    }
+}
+
 /// Configuration for PostgreSQL logical replication connections.
 ///
 /// # Example
@@ -267,7 +295,7 @@ pub struct ReplicationConfig {
     /// Name of the publication to subscribe to.
     ///
     /// The publication must exist and include the tables you want to replicate.
-    pub publication: String,
+    pub publication: Publication,
 
     /// LSN position to start replication from.
     ///
@@ -359,7 +387,7 @@ impl ReplicationConfig {
         password: impl Into<String>,
         database: impl Into<String>,
         slot: impl Into<String>,
-        publication: impl Into<String>,
+        publication: impl Into<Publication>,
     ) -> Self {
         Self {
             host: host.into(),
@@ -425,7 +453,7 @@ impl ReplicationConfig {
         password: impl Into<String>,
         database: impl Into<String>,
         slot: impl Into<String>,
-        publication: impl Into<String>,
+        publication: impl Into<Publication>,
     ) -> Self {
         Self {
             host: socket_dir.into(),

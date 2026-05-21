@@ -36,7 +36,7 @@ async fn main() -> anyhow::Result<()> {
         database,
         tls: TlsConfig::disabled(),
         slot,
-        publication,
+        publication: publication.into(),
         start_lsn,
         stop_at_lsn: None,
         status_interval: std::time::Duration::from_secs(1),
