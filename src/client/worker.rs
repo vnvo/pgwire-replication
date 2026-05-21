@@ -182,10 +182,15 @@ impl WorkerState {
     ) -> Result<()> {
         // Escape single quotes in publication name
         let publication = self.cfg.publication.replace('\'', "''");
+        let binary_opt = if self.cfg.binary {
+            ", binary 'true'"
+        } else {
+            ""
+        };
         let sql = format!(
             "START_REPLICATION SLOT {} LOGICAL {} \
-            (proto_version '1', publication_names '{}', messages 'true')",
-            self.cfg.slot, self.cfg.start_lsn, publication,
+            (proto_version '1', publication_names '{}', messages 'true'{})",
+            self.cfg.slot, self.cfg.start_lsn, publication, binary_opt,
         );
         write_query(stream, &sql).await?;
 
