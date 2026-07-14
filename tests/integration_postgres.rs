@@ -855,6 +855,87 @@ async fn postgres_replication_multiple_publications() -> Result<()> {
     Ok(())
 }
 
+/// Test binary-format replication (`binary 'true'`). Inserts an int with a
+/// recognizable value and asserts the raw pgoutput carries its 4-byte binary
+/// encoding (0x12345678) rather than the ASCII text form ("305419896") —
+/// proving the option actually took effect end to end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_replication_binary_format() -> Result<()> {
+    init_tracing();
+
+    let host_port: u16 = std::env::var("PG_ITEST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(get_available_port);
+
+    info!("starting postgres container on host port {host_port}");
+    let image = postgres_image(host_port);
+    let container = image.start().await.expect("start postgres");
+
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+
+    setup_publication_and_slot(&client, "slot_bin", "pub_bin").await?;
+    client.execute("DELETE FROM t", &[]).await?;
+
+    let base_lsn = current_wal_lsn(&client).await?;
+
+    let config = ReplicationConfig::new(
+        "127.0.0.1",
+        "postgres",
+        "postgres",
+        "postgres",
+        "slot_bin",
+        "pub_bin",
+    )
+    .with_port(host_port)
+    .with_tls(TlsConfig::disabled())
+    .with_start_lsn(base_lsn)
+    .with_status_interval(Duration::from_secs(1))
+    .with_wakeup_interval(Duration::from_secs(15))
+    .with_buffer_size(2048)
+    .with_binary(true);
+
+    let mut repl = ReplicationClient::connect(config).await?;
+    recv_keepalive(&mut repl, Duration::from_secs(10)).await?;
+
+    // 0x12345678 == 305419896
+    client
+        .execute("INSERT INTO t(id, v) VALUES (305419896, 'bin')", &[])
+        .await?;
+
+    // The Insert follows a Relation message, so scan payloads until we see the
+    // encoded id value one way or the other.
+    let mut found_binary = false;
+    let mut found_text = false;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline && !found_binary && !found_text {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let (_wal, data, _) = recv_until_xlog(&mut repl, remaining).await?;
+        if data.windows(4).any(|w| w == [0x12, 0x34, 0x56, 0x78]) {
+            found_binary = true;
+        } else if data.windows(9).any(|w| w == b"305419896") {
+            found_text = true;
+        }
+    }
+
+    anyhow::ensure!(
+        !found_text,
+        "int arrived text-encoded; binary 'true' did not take effect"
+    );
+    anyhow::ensure!(
+        found_binary,
+        "expected binary-encoded int4 (12 34 56 78) in a pgoutput Insert payload"
+    );
+
+    repl.stop();
+    let _ = repl.join().await;
+
+    info!("binary-format test completed successfully");
+    Ok(())
+}
+
 /// Test that `pg_logical_emit_message()` messages are received.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_logical_emit_message() -> Result<()> {

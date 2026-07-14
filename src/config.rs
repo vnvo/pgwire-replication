@@ -395,6 +395,25 @@ pub struct ReplicationConfig {
     ///
     /// Default: 8192 events
     pub buffer_events: usize,
+
+    /// Request column values in PostgreSQL binary wire format.
+    ///
+    /// When `true`, the `binary 'true'` option is added to `START_REPLICATION`
+    /// and `pgoutput` encodes column values using each type's binary send
+    /// function instead of text output.
+    ///
+    /// This does not change anything the library parses — the worker decodes
+    /// only Begin/Commit/Message boundaries and forwards `XLogData` tuple bytes
+    /// raw — so it is the **consumer's** decoder that must handle binary values.
+    ///
+    /// Leave as `false` (the default) unless you control both ends and have
+    /// measured a real win: any column whose type lacks a binary send function
+    /// makes the walsender error and close the replication stream.
+    ///
+    /// Requires PostgreSQL 14 or newer.
+    ///
+    /// Default: `false`
+    pub binary: bool,
 }
 
 impl Default for ReplicationConfig {
@@ -413,6 +432,7 @@ impl Default for ReplicationConfig {
             status_interval: Duration::from_secs(10),
             idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
+            binary: false,
         }
     }
 }
@@ -564,6 +584,14 @@ impl ReplicationConfig {
         self
     }
 
+    /// Request binary-format column values from `pgoutput` (requires PG 14+).
+    ///
+    /// See [`binary`](Self::binary) for caveats — off by default.
+    pub fn with_binary(mut self, binary: bool) -> Self {
+        self.binary = binary;
+        self
+    }
+
     /// Returns the connection string for display (password masked).
     ///
     /// Useful for logging without exposing credentials.
@@ -623,6 +651,13 @@ mod tests {
     fn publication_display_is_plain_join_without_escaping() {
         let p: Publication = ["a'b", "c"].into();
         assert_eq!(p.to_string(), "a'b,c");
+    }
+
+    #[test]
+    fn binary_defaults_off_and_builder_sets_it() {
+        assert!(!ReplicationConfig::default().binary);
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub").with_binary(true);
+        assert!(cfg.binary);
     }
 
     #[test]

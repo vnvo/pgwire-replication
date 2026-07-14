@@ -184,12 +184,18 @@ impl WorkerState {
         &self,
         stream: &mut S,
     ) -> Result<()> {
+        let binary_opt = if self.cfg.binary {
+            ", binary 'true'"
+        } else {
+            ""
+        };
         let sql = format!(
             "START_REPLICATION SLOT {} LOGICAL {} \
-            (proto_version '1', publication_names '{}', messages 'true')",
+            (proto_version '1', publication_names '{}', messages 'true'{})",
             self.cfg.slot,
             self.cfg.start_lsn,
             self.cfg.publication.to_option_value(),
+            binary_opt,
         );
         write_query(stream, &sql).await?;
 
