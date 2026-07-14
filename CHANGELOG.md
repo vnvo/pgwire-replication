@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [0.4.0] - 2026-07-14
+
+### Added
+- **Backpressure-safe standby feedback**: when the bounded event channel fills, the worker keeps sending standby-status/keepalive feedback every `status_interval` while it waits for capacity, instead of blocking silently. Previously a slow consumer could starve feedback until `wal_sender_timeout` fired, resetting the connection and forcing a full replay from `confirmed_flush` - a livelock under sustained load. Real backpressure still propagates via TCP flow control, and feedback reports only the applied LSN, so nothing is acknowledged before the consumer has durably processed it. (refs spiceai/spiceai#11616)
+- **Replication metrics**: `ReplicationClient::metrics()` returns an `Arc<ReplicationMetrics>` with pull-based counters — events forwarded, feedback sent, keepalive replies, stall count and cumulative stall duration, and the last applied / server WAL-end LSNs. Reads never block the worker.
+- **Multiple publications per slot**: a slot can now subscribe to several publications via the new `Publication` type. `new()` / `unix()` accept a single name (`"orders"`) or a collection (`["orders", "customers"]`, `Vec`, or any iterator). (#7 - thanks @reu)
+- **Optional binary output**: `ReplicationConfig::binary` / `with_binary()` request `pgoutput` `binary 'true'`, so column values are sent in PostgreSQL's binary wire format (PostgreSQL 14+). Off by default; the library forwards `XLogData` payloads unchanged, so consumers must decode accordingly. (#8 - thanks @reu)
+
+### Changed
+- **BREAKING**: `ReplicationConfig.publication` is now `Publication` instead of `String`. Single-name call sites using `new()` / `unix()` or `"...".into()` are unaffected.
+- **BREAKING**: `ReplicationConfig` is now `#[non_exhaustive]`. Construct it with `ReplicationConfig::new(...)` / `unix(...)` plus the `with_*` builder methods rather than a struct literal; future fields can then be added without another breaking release.
+
+### Notes
+- The feedback fix is a liveness/reliability improvement - it prevents a lagging consumer from collapsing into repeated resets. It does not change steady-state throughput.
+- Test quality was hardened with `cargo-mutants`: added unit tests for the metrics counters, config/TLS predicates, and the `START_REPLICATION` handshake, and a test asserting feedback stays rate-limited under backpressure.
+
+### Acknowledgements
+- Thanks to the SpiceAI team for the detailed root-cause analysis in spiceai/spiceai#11616 and for validating the approach in spiceai/spiceai#11653.
+
+---
+
 ## [0.3.2] - 2026-05-08
 
 ### Fixed

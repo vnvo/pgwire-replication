@@ -27,14 +27,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgwire-replication = "0.3.2"
+pgwire-replication = "0.4.0"
 ```
 
 Or with specific features:
 
 ```toml
 [dependencies]
-pgwire-replication = { version = "0.3.2", default-features = false, features = ["tls-rustls"] }
+pgwire-replication = { version = "0.4.0", default-features = false, features = ["tls-rustls"] }
 ```
 
 ## Requirements
@@ -50,6 +50,10 @@ pgwire-replication = { version = "0.3.2", default-features = false, features = [
 - `pg_logical_emit_message()` support
 - Bounded replay (`stop_at_lsn`)
 - Periodic standby status updates
+- Backpressure-safe feedback: keepalives keep flowing even when a slow consumer fills the event buffer, avoiding `wal_sender_timeout` resets
+- Multiple publications per replication slot
+- Optional `pgoutput` binary output format (PG 14+)
+- Pull-based replication metrics (`ReplicationClient::metrics()`)
 - Keepalive handling
 - Tokio-based async client
 - SCRAM-SHA-256 and MD5 authentication
@@ -105,10 +109,8 @@ LSNs (Log Sequence Numbers) are treated as first-class inputs and outputs and ar
 Every replication session begins at an explicit LSN:
 
 ```rust
-ReplicationConfig {
-    start_lsn: Lsn,
-    ..
-}
+let cfg = ReplicationConfig::new(host, user, password, database, slot, publication)
+    .with_start_lsn(start_lsn);
 ```
 
 This enables:
@@ -124,11 +126,9 @@ The provided LSN is sent verbatim to PostgreSQL via `START_REPLICATION`.
 Replication can be bounded using `stop_at_lsn`:
 
 ```rust
-ReplicationConfig {
-    start_lsn,
-    stop_at_lsn: Some(stop_lsn),
-    ..
-}
+let cfg = ReplicationConfig::new(host, user, password, database, slot, publication)
+    .with_start_lsn(start_lsn)
+    .with_stop_lsn(stop_lsn);
 ```
 
 When configured:
@@ -166,6 +166,68 @@ Updates are **monotonic**: reporting an older LSN is a no-op.
 Standby status updates are sent asynchronously by the worker using the
 latest applied LSN, based on `status_interval` or server keepalive requests.
 For CDC pipelines, progress should typically be reported at **transaction commit boundaries**, not for every message.
+
+## Backpressure
+
+The event channel between the worker and your consumer is bounded (`buffer_events`).
+If the consumer falls behind and the channel fills, the worker does **not** block
+silently: it keeps sending standby-status feedback every `status_interval` while
+waiting for capacity, so PostgreSQL never trips `wal_sender_timeout` and resets the
+stream (which would force a full replay from `confirmed_flush`). Real backpressure
+still propagates to the server through TCP flow control, and feedback reports only
+the applied LSN, so nothing is acknowledged that the consumer has not durably
+processed.
+
+## Multiple publications
+
+A single slot can subscribe to more than one publication. Pass a single name or a
+collection to `new()` / `unix()`:
+
+```rust
+// one publication
+ReplicationConfig::new(host, user, password, database, slot, "orders");
+
+// several publications on the same slot
+ReplicationConfig::new(host, user, password, database, slot, ["orders", "customers"]);
+```
+
+The publication set is bound once at `START_REPLICATION` and is fixed for the
+connection's lifetime; to change it, reconnect with a new config.
+
+## Binary output
+
+By default `pgoutput` emits column values in text format. Set `binary` to request
+PostgreSQL's binary wire format (PostgreSQL 14+):
+
+```rust
+ReplicationConfig::new(host, user, password, database, slot, publication)
+    .with_binary(true);
+```
+
+The library forwards `XLogData` payloads unchanged, so your decoder must handle
+binary values. Any column type without a binary send function makes the walsender
+error and close the stream, so leave this off unless you control both ends.
+
+## Observability
+
+`ReplicationClient::metrics()` returns an `Arc<ReplicationMetrics>` with pull-based
+counters you can scrape into your own metrics system:
+
+```rust
+let metrics = client.metrics();
+// ... later, from any task ...
+println!(
+    "events={} feedback={} stalls={} stall_us={}",
+    metrics.events_forwarded(),
+    metrics.feedback_sent(),
+    metrics.stall_count(),
+    metrics.stall_micros_total(),
+);
+```
+
+Counters include events forwarded, feedback sent, keepalive replies, stall count and
+cumulative stall duration, and the last applied / server WAL-end LSNs. Reads never
+block the worker.
 
 ## Idle behavior
 
@@ -222,14 +284,18 @@ let config = ReplicationConfig::unix(
 );
 ```
 
-Or equivalently via struct initialization:
+Or equivalently, since any `host` starting with `/` is treated as a socket
+directory, pass one to `new(...)`:
 ```rust
-let config = ReplicationConfig {
-    host: "/var/run/postgresql".into(),
-    port: 5432,
-    tls: TlsConfig::disabled(),
-    ..Default::default()
-};
+let config = ReplicationConfig::new(
+    "/var/run/postgresql", // host as socket directory
+    "replicator",
+    "secret",
+    "mydb",
+    "my_slot",
+    "my_pub",
+)
+.with_port(5432);
 ```
 
 Any `host` starting with `/` is treated as a Unix socket directory.
@@ -295,22 +361,21 @@ async fn main() -> anyhow::Result<()> {
     // - from a previous run.
     let start_lsn = Lsn::parse("0/16B6C50")?;
 
-    let cfg = ReplicationConfig {
-        host: "127.0.0.1".into(),
-        port: 5432,
-        user: "postgres".into(),
-        password: "postgres".into(),
-        database: "postgres".into(),
-        tls: TlsConfig::disabled(),
-        slot: "my_slot".into(),
-        publication: "my_pub".into(),
-        start_lsn,
-        stop_at_lsn: None,
-
-        status_interval: std::time::Duration::from_secs(10),
-        idle_wakeup_interval: std::time::Duration::from_secs(10),
-        buffer_events: 8192,
-    };
+    // ReplicationConfig is #[non_exhaustive]: build it with new()/unix() and the
+    // with_* methods. A single publication name is accepted directly; pass an
+    // array (e.g. ["pub_a", "pub_b"]) to subscribe to several at once.
+    let cfg = ReplicationConfig::new(
+        "127.0.0.1",
+        "postgres",
+        "postgres",
+        "postgres",
+        "my_slot",
+        "my_pub",
+    )
+    .with_tls(TlsConfig::disabled())
+    .with_start_lsn(start_lsn)
+    .with_status_interval(std::time::Duration::from_secs(10))
+    .with_wakeup_interval(std::time::Duration::from_secs(10));
 
     let mut client = ReplicationClient::connect(cfg).await?;
 
@@ -332,6 +397,10 @@ async fn main() -> anyhow::Result<()> {
                     println!("StoppedAt reached={reached}");
                     // break is optional; the stream should end shortly anyway
                     break;
+                }
+                ReplicationEvent::Begin { .. } | ReplicationEvent::Commit { .. } => {}
+                ReplicationEvent::Message { prefix, content, .. } => {
+                    println!("Message prefix={prefix:?} bytes={}", content.len());
                 }
             },
             Ok(None) => {
