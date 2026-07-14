@@ -911,6 +911,65 @@ mod tests {
         frame
     }
 
+    /// Build a `WorkerState` wired to in-memory channels for unit testing.
+    /// Returns the worker plus the stop sender and event receiver (held so the
+    /// channels stay open for the duration of the test).
+    fn test_worker(
+        cfg: ReplicationConfig,
+    ) -> (
+        WorkerState,
+        watch::Sender<bool>,
+        mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>,
+    ) {
+        let progress = Arc::new(SharedProgress::new(cfg.start_lsn));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (tx, rx) = mpsc::channel(16);
+        let metrics = Arc::new(ReplicationMetrics::default());
+        let worker = WorkerState::new(cfg, progress, stop_rx, tx, metrics);
+        (worker, stop_tx, rx)
+    }
+
+    #[tokio::test]
+    async fn start_replication_returns_ok_on_copy_both_response() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let (worker, _stop_tx, _rx) = test_worker(ReplicationConfig::default());
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+
+        // Server accepts the stream: CopyBothResponse ('W', empty payload).
+        server.write_all(&[b'W', 0, 0, 0, 4]).await.unwrap();
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.start_replication(&mut worker_end),
+        )
+        .await;
+        assert!(matches!(res, Ok(Ok(()))), "expected Ok on 'W', got {res:?}");
+    }
+
+    #[tokio::test]
+    async fn start_replication_surfaces_server_error_response() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let (worker, _stop_tx, _rx) = test_worker(ReplicationConfig::default());
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+
+        // Server rejects the stream: ErrorResponse ('E') with an empty field list.
+        server.write_all(&[b'E', 0, 0, 0, 5, 0]).await.unwrap();
+
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            worker.start_replication(&mut worker_end),
+        )
+        .await;
+        assert!(
+            matches!(res, Ok(Err(PgWireError::Server(_)))),
+            "expected Server error on 'E', got {res:?}"
+        );
+    }
+
     /// Regression test for the keepalive/feedback starvation bug
     /// (spiceai/spiceai#11616): when the event channel fills and the consumer
     /// never drains, the worker must keep emitting standby-status feedback so
@@ -980,6 +1039,74 @@ mod tests {
             metrics.feedback_sent() >= 3,
             "feedback_sent metric should track sends, got {}",
             metrics.feedback_sent()
+        );
+
+        let _ = stop_tx.send(true);
+        let _ = worker_task.await;
+    }
+
+    /// Feedback under backpressure must be *rate-limited* to `status_interval`,
+    /// not emitted on every loop iteration. Guards the stall-loop deadline math:
+    /// a wrong sign (deadline in the past) would busy-loop and flood the server.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn feedback_under_backpressure_is_rate_limited() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let interval = Duration::from_millis(50);
+        let cfg = ReplicationConfig {
+            status_interval: interval,
+            idle_wakeup_interval: Duration::from_secs(10),
+            buffer_events: 2,
+            ..Default::default()
+        };
+
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (tx, _rx_never_drained) = mpsc::channel(cfg.buffer_events);
+        let metrics = Arc::new(ReplicationMetrics::default());
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, tx, Arc::clone(&metrics));
+
+        let (worker_end, mut test_end) = tokio::io::duplex(64 * 1024);
+        let worker_task = tokio::spawn(async move {
+            let mut buf = BufReader::with_capacity(1024, worker_end);
+            let _ = worker.stream_loop(&mut buf).await;
+        });
+
+        for i in 1..=5u64 {
+            test_end.write_all(&xlog_frame(i, b"Idummy")).await.unwrap();
+        }
+        test_end.flush().await.unwrap();
+
+        // Over a fixed window, correct behavior emits roughly window/interval
+        // feedbacks (~7 here). A deadline that fires every iteration would emit
+        // far more, so a generous upper bound catches the flooding regression
+        // while the lower bound confirms feedback keeps flowing.
+        let window = Duration::from_millis(350);
+        let end = Instant::now() + window;
+        let mut reader = MessageReader::new();
+        let mut feedback = 0usize;
+        loop {
+            let remaining = end.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, reader.read(&mut test_end)).await {
+                Ok(Ok(msg)) if msg.tag == b'd' && msg.payload.first() == Some(&b'r') => {
+                    feedback += 1;
+                }
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+        }
+
+        assert!(
+            feedback >= 2,
+            "feedback should keep flowing under backpressure, got {feedback}"
+        );
+        assert!(
+            feedback <= 25,
+            "feedback must be rate-limited to ~status_interval, got {feedback}"
         );
 
         let _ = stop_tx.send(true);

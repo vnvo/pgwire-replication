@@ -654,6 +654,65 @@ mod tests {
     }
 
     #[test]
+    fn sslmode_verification_predicates() {
+        assert!(SslMode::VerifyCa.verifies_certificate());
+        assert!(SslMode::VerifyFull.verifies_certificate());
+        assert!(!SslMode::Require.verifies_certificate());
+
+        assert!(SslMode::VerifyFull.verifies_hostname());
+        assert!(!SslMode::VerifyCa.verifies_hostname());
+        assert!(!SslMode::Require.verifies_hostname());
+    }
+
+    #[test]
+    fn verify_ca_sets_mode_and_ca_path() {
+        let tls = TlsConfig::verify_ca(Some("/ca.pem".into()));
+        assert_eq!(tls.mode, SslMode::VerifyCa);
+        assert_eq!(tls.ca_pem_path, Some("/ca.pem".into()));
+    }
+
+    #[test]
+    fn is_mtls_requires_both_cert_and_key() {
+        let both = TlsConfig::verify_full(None).with_client_cert("/c.pem", "/k.pem");
+        assert!(both.is_mtls());
+
+        let neither = TlsConfig::verify_full(None);
+        assert!(!neither.is_mtls());
+
+        let cert_only = TlsConfig {
+            client_key_pem_path: None,
+            ..TlsConfig::verify_full(None).with_client_cert("/c.pem", "/k.pem")
+        };
+        assert!(!cert_only.is_mtls());
+    }
+
+    #[test]
+    fn is_unix_socket_and_path() {
+        let tcp = ReplicationConfig::new("127.0.0.1", "u", "p", "db", "s", "pub");
+        assert!(!tcp.is_unix_socket());
+
+        let unix = ReplicationConfig::unix("/var/run/postgresql", 5432, "u", "p", "db", "s", "pub");
+        assert!(unix.is_unix_socket());
+        assert_eq!(
+            unix.unix_socket_path(),
+            std::path::PathBuf::from("/var/run/postgresql/.s.PGSQL.5432")
+        );
+    }
+
+    #[test]
+    fn display_connection_masks_password_and_shows_target() {
+        let cfg = ReplicationConfig::new("db.example.com", "alice", "secret", "mydb", "s", "pub")
+            .with_port(6432);
+        let shown = cfg.display_connection();
+        assert!(shown.contains("alice"));
+        assert!(shown.contains("db.example.com"));
+        assert!(shown.contains("6432"));
+        assert!(shown.contains("mydb"));
+        assert!(shown.contains("***"));
+        assert!(!shown.contains("secret"));
+    }
+
+    #[test]
     fn binary_defaults_off_and_builder_sets_it() {
         assert!(!ReplicationConfig::default().binary);
         let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub").with_binary(true);

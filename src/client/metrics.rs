@@ -107,3 +107,49 @@ impl ReplicationMetrics {
         self.last_wal_end.store(wal_end.as_u64(), Ordering::Relaxed);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_start_at_zero() {
+        let m = ReplicationMetrics::default();
+        assert_eq!(m.events_forwarded(), 0);
+        assert_eq!(m.feedback_sent(), 0);
+        assert_eq!(m.keepalive_replies(), 0);
+        assert_eq!(m.stall_count(), 0);
+        assert_eq!(m.stall_micros_total(), 0);
+        assert_eq!(m.last_applied_lsn(), Lsn::ZERO);
+        assert_eq!(m.last_wal_end(), Lsn::ZERO);
+    }
+
+    #[test]
+    fn recorders_update_their_counters() {
+        let m = ReplicationMetrics::default();
+
+        m.record_event_forwarded();
+        m.record_event_forwarded();
+        assert_eq!(m.events_forwarded(), 2);
+
+        m.record_feedback_sent(Lsn::from_u64(42));
+        assert_eq!(m.feedback_sent(), 1);
+        assert_eq!(m.last_applied_lsn(), Lsn::from_u64(42));
+
+        m.record_keepalive_reply();
+        assert_eq!(m.keepalive_replies(), 1);
+
+        m.record_stall_begin();
+        assert_eq!(m.stall_count(), 1);
+        assert_eq!(m.stall_micros_total(), 0);
+
+        m.record_stall_end(100);
+        m.record_stall_end(50);
+        assert_eq!(m.stall_micros_total(), 150);
+        // Duration accrues without re-counting the stall.
+        assert_eq!(m.stall_count(), 1);
+
+        m.set_last_wal_end(Lsn::from_u64(7));
+        assert_eq!(m.last_wal_end(), Lsn::from_u64(7));
+    }
+}

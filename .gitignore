@@ -1,6 +1,10 @@
 /target
 Cargo.lock
 
+# cargo-mutants output
+/mutants.out/
+/mutants.out.old/
+
 .docker
 docker-data
 testcontainers
