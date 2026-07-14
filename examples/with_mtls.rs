@@ -51,30 +51,26 @@ pub async fn main() -> anyhow::Result<()> {
     );
 
     // ---- Replication config ----
-    let cfg = ReplicationConfig {
+    let cfg = ReplicationConfig::new(
         host,
-        port,
-        user: repl_user,
-        password: repl_password,
-        database: pg_database,
-
-        tls: TlsConfig {
-            mode: SslMode::VerifyFull,
-            ca_pem_path: Some(ca_pem),
-            sni_hostname: Some(sni),
-            client_cert_pem_path: Some(client_cert),
-            client_key_pem_path: Some(client_key),
-        },
-
+        repl_user,
+        repl_password,
+        pg_database,
         slot,
         publication,
-        start_lsn,
-        stop_at_lsn: None,
-
-        status_interval: std::time::Duration::from_secs(1),
-        idle_wakeup_interval: std::time::Duration::from_secs(30),
-        buffer_events: 8192,
-    };
+    )
+    .with_port(port)
+    .with_tls(TlsConfig {
+        mode: SslMode::VerifyFull,
+        ca_pem_path: Some(ca_pem),
+        sni_hostname: Some(sni),
+        client_cert_pem_path: Some(client_cert),
+        client_key_pem_path: Some(client_key),
+    })
+    .with_start_lsn(start_lsn)
+    .with_status_interval(std::time::Duration::from_secs(1))
+    .with_wakeup_interval(std::time::Duration::from_secs(30))
+    .with_buffer_size(8192);
 
     let mut repl = ReplicationClient::connect(cfg).await?;
     loop {

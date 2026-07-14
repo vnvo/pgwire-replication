@@ -206,21 +206,24 @@ fn replication_config(
     start_lsn: Lsn,
     stop_at_lsn: Option<Lsn>,
 ) -> ReplicationConfig {
-    ReplicationConfig {
-        host: "127.0.0.1".into(),
-        port: host_port,
-        user: "postgres".into(),
-        password: "postgres".into(),
-        database: "postgres".into(),
-        tls: TlsConfig::disabled(),
-        slot: slot.into(),
-        publication: publication.into(),
-        start_lsn,
-        stop_at_lsn,
-        status_interval: Duration::from_secs(1),
-        idle_wakeup_interval: Duration::from_secs(15),
-        buffer_events: 2048,
+    let mut config = ReplicationConfig::new(
+        "127.0.0.1",
+        "postgres",
+        "postgres",
+        "postgres",
+        slot,
+        publication,
+    )
+    .with_port(host_port)
+    .with_tls(TlsConfig::disabled())
+    .with_start_lsn(start_lsn)
+    .with_status_interval(Duration::from_secs(1))
+    .with_wakeup_interval(Duration::from_secs(15))
+    .with_buffer_size(2048);
+    if let Some(stop) = stop_at_lsn {
+        config = config.with_stop_lsn(stop);
     }
+    config
 }
 
 async fn start_repl(
@@ -753,6 +756,105 @@ async fn postgres_replication_multi_table() -> Result<()> {
     Ok(())
 }
 
+/// Test subscribing to *multiple publications* on one slot. Each table lives in
+/// its own publication, so receiving changes from both proves both publications
+/// are streaming (distinct from the single-publication multi-table test above).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_replication_multiple_publications() -> Result<()> {
+    init_tracing();
+
+    let host_port: u16 = std::env::var("PG_ITEST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(get_available_port);
+
+    info!("starting postgres container on host port {host_port}");
+    let image = postgres_image(host_port);
+    let container = image.start().await.expect("start postgres");
+
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+
+    // Two tables, each exposed through its OWN publication.
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS t_a(id INT PRIMARY KEY, v TEXT);
+             CREATE TABLE IF NOT EXISTS t_b(id INT PRIMARY KEY, v TEXT);",
+        )
+        .await?;
+
+    client
+        .batch_execute("DROP PUBLICATION IF EXISTS pub_a; DROP PUBLICATION IF EXISTS pub_b;")
+        .await?;
+    client
+        .batch_execute("CREATE PUBLICATION pub_a FOR TABLE t_a;")
+        .await?;
+    client
+        .batch_execute("CREATE PUBLICATION pub_b FOR TABLE t_b;")
+        .await?;
+
+    client
+        .batch_execute(
+            "SELECT pg_drop_replication_slot('slot_multi_pub')
+             WHERE EXISTS (SELECT 1 FROM pg_replication_slots WHERE slot_name='slot_multi_pub');",
+        )
+        .await?;
+    client
+        .batch_execute(
+            "SELECT * FROM pg_create_logical_replication_slot('slot_multi_pub','pgoutput');",
+        )
+        .await?;
+
+    client.execute("DELETE FROM t_a", &[]).await?;
+    client.execute("DELETE FROM t_b", &[]).await?;
+
+    let base_lsn = current_wal_lsn(&client).await?;
+
+    // Subscribe to BOTH publications via the Publication multi-value form.
+    let config = ReplicationConfig::new(
+        "127.0.0.1",
+        "postgres",
+        "postgres",
+        "postgres",
+        "slot_multi_pub",
+        ["pub_a", "pub_b"],
+    )
+    .with_port(host_port)
+    .with_tls(TlsConfig::disabled())
+    .with_start_lsn(base_lsn)
+    .with_status_interval(Duration::from_secs(1))
+    .with_wakeup_interval(Duration::from_secs(15))
+    .with_buffer_size(2048);
+
+    let mut repl = ReplicationClient::connect(config).await?;
+
+    recv_keepalive(&mut repl, Duration::from_secs(10)).await?;
+
+    // A change to a table in pub_a must stream...
+    client
+        .execute("INSERT INTO t_a(id, v) VALUES (1, 'from_pub_a')", &[])
+        .await?;
+    let (_wal_a, data_a, _) = recv_until_xlog(&mut repl, Duration::from_secs(10)).await?;
+    info!("t_a insert (pub_a): bytes={}", data_a.len());
+
+    // ...and so must a change to a table that lives only in pub_b.
+    client
+        .execute("INSERT INTO t_b(id, v) VALUES (1, 'from_pub_b')", &[])
+        .await?;
+    let (_wal_b, data_b, _) = recv_until_xlog(&mut repl, Duration::from_secs(10)).await?;
+    info!("t_b insert (pub_b): bytes={}", data_b.len());
+
+    anyhow::ensure!(!data_a.is_empty(), "expected payload from pub_a table");
+    anyhow::ensure!(!data_b.is_empty(), "expected payload from pub_b table");
+
+    repl.stop();
+    let _ = repl.join().await;
+
+    info!("multiple-publications test completed successfully");
+    Ok(())
+}
+
 /// Test that `pg_logical_emit_message()` messages are received.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_logical_emit_message() -> Result<()> {
@@ -910,21 +1012,20 @@ host    replication     all             ::/0                    scram-sha-256
     info!("SCRAM test: base_lsn={base_lsn}");
 
     // Now connect with our replication client using SCRAM
-    let config = ReplicationConfig {
-        host: "127.0.0.1".into(),
-        port: host_port,
-        user: "scram_user".into(),
-        password: "scram_test_password".into(),
-        database: "postgres".into(),
-        tls: TlsConfig::disabled(),
-        slot: "slot_scram".into(),
-        publication: "pub_scram".into(),
-        start_lsn: base_lsn,
-        stop_at_lsn: None,
-        status_interval: Duration::from_secs(1),
-        idle_wakeup_interval: Duration::from_secs(15),
-        buffer_events: 1024,
-    };
+    let config = ReplicationConfig::new(
+        "127.0.0.1",
+        "scram_user",
+        "scram_test_password",
+        "postgres",
+        "slot_scram",
+        "pub_scram",
+    )
+    .with_port(host_port)
+    .with_tls(TlsConfig::disabled())
+    .with_start_lsn(base_lsn)
+    .with_status_interval(Duration::from_secs(1))
+    .with_wakeup_interval(Duration::from_secs(15))
+    .with_buffer_size(1024);
 
     let mut repl = ReplicationClient::connect(config)
         .await
@@ -1124,21 +1225,20 @@ async fn postgres_replication_tls() -> Result<()> {
     // Connect with TLS (verify-ca mode since we're using localhost)
     let tls_config = TlsConfig::verify_ca(Some(ca_cert.clone()));
 
-    let config = ReplicationConfig {
-        host: "127.0.0.1".into(),
-        port: host_port,
-        user: "postgres".into(),
-        password: "postgres".into(),
-        database: "postgres".into(),
-        tls: tls_config,
-        slot: "slot_tls".into(),
-        publication: "pub_tls".into(),
-        start_lsn: base_lsn,
-        stop_at_lsn: None,
-        status_interval: Duration::from_secs(1),
-        idle_wakeup_interval: Duration::from_secs(15),
-        buffer_events: 1024,
-    };
+    let config = ReplicationConfig::new(
+        "127.0.0.1",
+        "postgres",
+        "postgres",
+        "postgres",
+        "slot_tls",
+        "pub_tls",
+    )
+    .with_port(host_port)
+    .with_tls(tls_config)
+    .with_start_lsn(base_lsn)
+    .with_status_interval(Duration::from_secs(1))
+    .with_wakeup_interval(Duration::from_secs(15))
+    .with_buffer_size(1024);
 
     info!("TLS connection successful, waiting for keepalive");
 
@@ -1269,21 +1369,20 @@ async fn postgres_replication_tls_require_mode() -> Result<()> {
     let base_lsn = current_wal_lsn(&client).await?;
 
     // Connect with TLS require mode (no verification)
-    let config = ReplicationConfig {
-        host: "127.0.0.1".into(),
-        port: host_port,
-        user: "postgres".into(),
-        password: "postgres".into(),
-        database: "postgres".into(),
-        tls: TlsConfig::require(),
-        slot: "slot_tls_req".into(),
-        publication: "pub_tls_req".into(),
-        start_lsn: base_lsn,
-        stop_at_lsn: None,
-        status_interval: Duration::from_secs(1),
-        idle_wakeup_interval: Duration::from_secs(15),
-        buffer_events: 1024,
-    };
+    let config = ReplicationConfig::new(
+        "127.0.0.1",
+        "postgres",
+        "postgres",
+        "postgres",
+        "slot_tls_req",
+        "pub_tls_req",
+    )
+    .with_port(host_port)
+    .with_tls(TlsConfig::require())
+    .with_start_lsn(base_lsn)
+    .with_status_interval(Duration::from_secs(1))
+    .with_wakeup_interval(Duration::from_secs(15))
+    .with_buffer_size(1024);
 
     let mut repl = ReplicationClient::connect(config)
         .await
@@ -1417,21 +1516,20 @@ async fn postgres_replication_tls_wrong_ca_fails() -> Result<()> {
     let base_lsn = current_wal_lsn(&client).await?;
 
     // Try to connect with wrong CA - should fail verification
-    let config = ReplicationConfig {
-        host: "127.0.0.1".into(),
-        port: host_port,
-        user: "postgres".into(),
-        password: "postgres".into(),
-        database: "postgres".into(),
-        tls: TlsConfig::verify_ca(Some(wrong_ca)), // Wrong CA!
-        slot: "slot_wrong_ca".into(),
-        publication: "pub_wrong_ca".into(),
-        start_lsn: base_lsn,
-        stop_at_lsn: None,
-        status_interval: Duration::from_secs(1),
-        idle_wakeup_interval: Duration::from_secs(15),
-        buffer_events: 1024,
-    };
+    let config = ReplicationConfig::new(
+        "127.0.0.1",
+        "postgres",
+        "postgres",
+        "postgres",
+        "slot_wrong_ca",
+        "pub_wrong_ca",
+    )
+    .with_port(host_port)
+    .with_tls(TlsConfig::verify_ca(Some(wrong_ca))) // Wrong CA!
+    .with_start_lsn(base_lsn)
+    .with_status_interval(Duration::from_secs(1))
+    .with_wakeup_interval(Duration::from_secs(15))
+    .with_buffer_size(1024);
 
     let result = ReplicationClient::connect(config).await;
 

@@ -214,29 +214,110 @@ impl TlsConfig {
     }
 }
 
+/// One or more publication names a replication slot subscribes to.
+///
+/// A single slot can stream changes from several publications at once.
+/// Construct from a single name or from a collection:
+///
+/// ```
+/// use pgwire_replication::config::Publication;
+///
+/// let one: Publication = "orders".into();
+/// let many: Publication = ["orders", "customers"].into();
+/// let dynamic: Publication = vec![String::from("a"), String::from("b")].into();
+/// ```
+///
+/// `Publication` is an immutable value fixed for the connection's lifetime: the
+/// `publication_names` set is bound once at `START_REPLICATION` and cannot be
+/// changed on a live stream. To replicate a different set, reconnect with a new
+/// [`ReplicationConfig`].
+///
+/// # Limitations
+///
+/// Names are joined into PostgreSQL's comma-separated `publication_names` list,
+/// so a name containing a comma or whitespace cannot be represented (a
+/// pre-existing PostgreSQL constraint). Single quotes in names are escaped. An
+/// empty `Publication` is invalid and the server will reject the stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Publication(Vec<String>);
+
+impl Publication {
+    /// The publication names, in order.
+    #[inline]
+    pub fn names(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Render the value for the `publication_names` `START_REPLICATION` option:
+    /// single quotes escaped, names comma-separated.
+    pub(crate) fn to_option_value(&self) -> String {
+        self.0
+            .iter()
+            .map(|name| name.replace('\'', "''"))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+impl From<&str> for Publication {
+    fn from(value: &str) -> Self {
+        Self(vec![value.to_string()])
+    }
+}
+
+impl From<String> for Publication {
+    fn from(value: String) -> Self {
+        Self(vec![value])
+    }
+}
+
+impl<A: Into<String>, const N: usize> From<[A; N]> for Publication {
+    fn from(value: [A; N]) -> Self {
+        Self(value.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<A: Into<String>> From<Vec<A>> for Publication {
+    fn from(value: Vec<A>) -> Self {
+        Self(value.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<A: Into<String>> FromIterator<A> for Publication {
+    fn from_iter<T: IntoIterator<Item = A>>(iter: T) -> Self {
+        Self(iter.into_iter().map(Into::into).collect())
+    }
+}
+
+impl std::fmt::Display for Publication {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.join(","))
+    }
+}
+
 /// Configuration for PostgreSQL logical replication connections.
 ///
 /// # Example
 ///
 /// ```
-/// use pgwire_replication::config::{ReplicationConfig, TlsConfig, SslMode};
-/// use pgwire_replication::lsn::Lsn;
-/// use std::time::Duration;
+/// use pgwire_replication::config::{ReplicationConfig, TlsConfig};
 ///
-/// let config = ReplicationConfig {
-///     host: "db.example.com".into(),
-///     port: 5432,
-///     user: "replicator".into(),
-///     password: "secret".into(),
-///     database: "mydb".into(),
-///     slot: "my_slot".into(),
-///     publication: "my_publication".into(),
-///     tls: TlsConfig::verify_full(Some("/path/to/ca.pem".into())),
-///     start_lsn: Lsn(0),  // Start from slot's confirmed position
-///     ..Default::default()
-/// };
+/// let config = ReplicationConfig::new(
+///     "db.example.com",
+///     "replicator",
+///     "secret",
+///     "mydb",
+///     "my_slot",
+///     "my_publication",
+/// )
+/// .with_tls(TlsConfig::verify_full(Some("/path/to/ca.pem".into())));
 /// ```
+///
+/// This struct is `#[non_exhaustive]`: construct it with [`ReplicationConfig::new`]
+/// (or [`unix`](ReplicationConfig::unix)) plus the `with_*` builder methods
+/// rather than a struct literal, so new fields can be added without breaking you.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReplicationConfig {
     /// PostgreSQL server hostname or IP address.
     pub host: String,
@@ -264,10 +345,11 @@ pub struct ReplicationConfig {
     /// using the `pgoutput` plugin.
     pub slot: String,
 
-    /// Name of the publication to subscribe to.
+    /// Publication(s) to subscribe to.
     ///
-    /// The publication must exist and include the tables you want to replicate.
-    pub publication: String,
+    /// Each publication must exist and include the tables you want to replicate.
+    /// Accepts a single name or a collection — see [`Publication`].
+    pub publication: Publication,
 
     /// LSN position to start replication from.
     ///
@@ -359,7 +441,7 @@ impl ReplicationConfig {
         password: impl Into<String>,
         database: impl Into<String>,
         slot: impl Into<String>,
-        publication: impl Into<String>,
+        publication: impl Into<Publication>,
     ) -> Self {
         Self {
             host: host.into(),
@@ -425,7 +507,7 @@ impl ReplicationConfig {
         password: impl Into<String>,
         database: impl Into<String>,
         slot: impl Into<String>,
-        publication: impl Into<String>,
+        publication: impl Into<Publication>,
     ) -> Self {
         Self {
             host: socket_dir.into(),
@@ -500,5 +582,55 @@ impl ReplicationConfig {
                 self.user, self.host, self.port, self.database
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_from_single_str() {
+        let p: Publication = "orders".into();
+        assert_eq!(p.names(), ["orders"]);
+        assert_eq!(p.to_option_value(), "orders");
+    }
+
+    #[test]
+    fn publication_from_array_is_comma_joined() {
+        let p: Publication = ["orders", "customers"].into();
+        assert_eq!(p.names(), ["orders", "customers"]);
+        assert_eq!(p.to_option_value(), "orders,customers");
+    }
+
+    #[test]
+    fn publication_from_vec_and_from_iter() {
+        let from_vec: Publication = vec![String::from("a"), String::from("b")].into();
+        assert_eq!(from_vec.to_option_value(), "a,b");
+
+        let collected: Publication = ["x", "y", "z"].into_iter().collect();
+        assert_eq!(collected.to_option_value(), "x,y,z");
+    }
+
+    #[test]
+    fn publication_escapes_single_quotes_per_name() {
+        let p: Publication = ["a'b", "c"].into();
+        // Each single quote is doubled; names remain comma-separated.
+        assert_eq!(p.to_option_value(), "a''b,c");
+    }
+
+    #[test]
+    fn publication_display_is_plain_join_without_escaping() {
+        let p: Publication = ["a'b", "c"].into();
+        assert_eq!(p.to_string(), "a'b,c");
+    }
+
+    #[test]
+    fn new_accepts_single_and_multiple_publications() {
+        let single = ReplicationConfig::new("h", "u", "p", "db", "slot", "solo");
+        assert_eq!(single.publication.to_option_value(), "solo");
+
+        let multi = ReplicationConfig::new("h", "u", "p", "db", "slot", ["one", "two"]);
+        assert_eq!(multi.publication.to_option_value(), "one,two");
     }
 }

@@ -28,21 +28,13 @@ async fn main() -> anyhow::Result<()> {
 
     println!("starting replication from start_lsn={start_lsn}");
 
-    let cfg = ReplicationConfig {
-        host,
-        port,
-        user,
-        password,
-        database,
-        tls: TlsConfig::disabled(),
-        slot,
-        publication,
-        start_lsn,
-        stop_at_lsn: None,
-        status_interval: std::time::Duration::from_secs(1),
-        idle_wakeup_interval: std::time::Duration::from_secs(30),
-        buffer_events: 8192,
-    };
+    let cfg = ReplicationConfig::new(host, user, password, database, slot, publication)
+        .with_port(port)
+        .with_tls(TlsConfig::disabled())
+        .with_start_lsn(start_lsn)
+        .with_status_interval(std::time::Duration::from_secs(1))
+        .with_wakeup_interval(std::time::Duration::from_secs(30))
+        .with_buffer_size(8192);
 
     let mut repl = ReplicationClient::connect(cfg).await?;
 

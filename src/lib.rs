@@ -13,20 +13,17 @@
 //!
 //! ```rust,no_run
 //! use pgwire_replication::{ReplicationClient, ReplicationConfig, ReplicationEvent, Lsn};
-//! use std::time::Duration;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! let config = ReplicationConfig {
-//!     host: "localhost".into(),
-//!     port: 5432,
-//!     user: "postgres".into(),
-//!     password: "secret".into(),
-//!     database: "mydb".into(),
-//!     slot: "my_slot".into(),
-//!     publication: "my_publication".into(),
-//!     start_lsn: Lsn::ZERO,
-//!     ..Default::default()
-//! };
+//! let config = ReplicationConfig::new(
+//!     "localhost",
+//!     "postgres",
+//!     "secret",
+//!     "mydb",
+//!     "my_slot",
+//!     "my_publication",
+//! )
+//! .with_start_lsn(Lsn::ZERO);
 //!
 //! let mut client = ReplicationClient::connect(config).await?;
 //!
@@ -87,6 +84,6 @@ pub mod tls;
 pub use client::{
     ReplicationClient, ReplicationEvent, ReplicationEventReceiver, ReplicationMetrics,
 };
-pub use config::{ReplicationConfig, SslMode, TlsConfig};
+pub use config::{Publication, ReplicationConfig, SslMode, TlsConfig};
 pub use error::{PgWireError, Result};
 pub use lsn::Lsn;

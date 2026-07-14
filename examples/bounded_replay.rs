@@ -37,22 +37,14 @@ pub async fn main() -> anyhow::Result<()> {
     let stop_at_lsn = current_wal_lsn(&sql).await?;
     println!("bounded replay start={start_lsn} stop_at={stop_at_lsn}");
 
-    let cfg = ReplicationConfig {
-        host,
-        port,
-        user,
-        password,
-        database,
-        tls: TlsConfig::disabled(),
-        slot,
-        publication,
-        start_lsn,
-        stop_at_lsn: Some(stop_at_lsn),
-
-        status_interval: std::time::Duration::from_secs(1),
-        idle_wakeup_interval: std::time::Duration::from_secs(30),
-        buffer_events: 8192,
-    };
+    let cfg = ReplicationConfig::new(host, user, password, database, slot, publication)
+        .with_port(port)
+        .with_tls(TlsConfig::disabled())
+        .with_start_lsn(start_lsn)
+        .with_stop_lsn(stop_at_lsn)
+        .with_status_interval(std::time::Duration::from_secs(1))
+        .with_wakeup_interval(std::time::Duration::from_secs(30))
+        .with_buffer_size(8192);
 
     let mut repl = ReplicationClient::connect(cfg).await?;
 
