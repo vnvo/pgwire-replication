@@ -14,6 +14,7 @@ use std::sync::Arc;
 #[cfg(not(feature = "tls-rustls"))]
 use crate::config::SslMode;
 
+use super::metrics::ReplicationMetrics;
 use super::worker::{ReplicationEvent, ReplicationEventReceiver, SharedProgress, WorkerState};
 
 /// PostgreSQL logical replication client.
@@ -66,6 +67,7 @@ pub struct ReplicationClient {
     rx: ReplicationEventReceiver,
     progress: Arc<SharedProgress>,
     stop_tx: watch::Sender<bool>,
+    metrics: Arc<ReplicationMetrics>,
     join: Option<JoinHandle<std::result::Result<(), PgWireError>>>,
 }
 
@@ -94,11 +96,20 @@ impl ReplicationClient {
 
         let (stop_tx, stop_rx) = watch::channel(false);
 
+        let metrics = Arc::new(ReplicationMetrics::default());
+
         let progress_for_worker = Arc::clone(&progress);
+        let metrics_for_worker = Arc::clone(&metrics);
         let cfg_for_worker = cfg.clone();
 
         let join = tokio::spawn(async move {
-            let mut worker = WorkerState::new(cfg_for_worker, progress_for_worker, stop_rx, tx);
+            let mut worker = WorkerState::new(
+                cfg_for_worker,
+                progress_for_worker,
+                stop_rx,
+                tx,
+                metrics_for_worker,
+            );
             let res = run_worker(&mut worker, &cfg).await;
             if let Err(ref e) = res {
                 tracing::error!("replication worker terminated with error: {e}");
@@ -110,6 +121,7 @@ impl ReplicationClient {
             rx,
             progress,
             stop_tx,
+            metrics,
             join: Some(join),
         })
     }
@@ -150,6 +162,16 @@ impl ReplicationClient {
     #[inline]
     pub fn update_applied_lsn(&self, lsn: Lsn) {
         self.progress.update_applied(lsn);
+    }
+
+    /// Returns a handle to the live replication metrics.
+    ///
+    /// The returned `Arc` shares the same counters the background worker
+    /// updates, so reads reflect current progress. Cheap to clone and call
+    /// repeatedly; nothing here blocks the worker.
+    #[inline]
+    pub fn metrics(&self) -> Arc<ReplicationMetrics> {
+        Arc::clone(&self.metrics)
     }
 
     /// Request the worker to stop gracefully.

@@ -5,6 +5,7 @@ use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
+use super::metrics::ReplicationMetrics;
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
@@ -131,6 +132,7 @@ pub struct WorkerState {
     progress: Arc<SharedProgress>,
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
+    metrics: Arc<ReplicationMetrics>,
 }
 
 impl WorkerState {
@@ -139,12 +141,14 @@ impl WorkerState {
         progress: Arc<SharedProgress>,
         stop_rx: watch::Receiver<bool>,
         out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
+        metrics: Arc<ReplicationMetrics>,
     ) -> Self {
         Self {
             cfg,
             progress,
             stop_rx,
             out,
+            metrics,
         }
     }
 
@@ -340,20 +344,31 @@ impl WorkerState {
                 server_time_micros,
                 reply_requested,
             } => {
+                self.metrics.set_last_wal_end(wal_end);
+
                 // Respond immediately if server requests it
                 if reply_requested {
                     let applied = self.progress.load_applied();
                     *last_applied = applied;
                     self.send_feedback(stream, applied, true).await?;
                     *last_status_sent = Instant::now();
+                    self.metrics.record_keepalive_reply();
                 }
 
-                self.send_event(Ok(ReplicationEvent::KeepAlive {
-                    wal_end,
-                    reply_requested,
-                    server_time_micros,
-                }))
-                .await;
+                if self
+                    .send_event_backpressured(
+                        stream,
+                        Ok(ReplicationEvent::KeepAlive {
+                            wal_end,
+                            reply_requested,
+                            server_time_micros,
+                        }),
+                        last_status_sent,
+                    )
+                    .await?
+                {
+                    return Ok(true);
+                }
 
                 Ok(false)
             }
@@ -363,6 +378,8 @@ impl WorkerState {
                 server_time_micros,
                 data,
             } => {
+                self.metrics.set_last_wal_end(wal_end);
+
                 // If the payload is a pgoutput Begin/Commit message, emit only the boundary event.
                 if let Some(boundary_ev) = parse_pgoutput_boundary(&data)? {
                     let reached_lsn = match boundary_ev {
@@ -371,15 +388,28 @@ impl WorkerState {
                         _ => wal_end, // should never happen if parser only returns Begin/Commit
                     };
 
-                    self.send_event(Ok(boundary_ev)).await;
+                    if self
+                        .send_event_backpressured(stream, Ok(boundary_ev), last_status_sent)
+                        .await?
+                    {
+                        return Ok(true);
+                    }
 
                     // Stop condition (prefer boundary LSN semantics when available)
                     if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                         if reached_lsn >= stop_lsn {
-                            self.send_event(Ok(ReplicationEvent::StoppedAt {
-                                reached: reached_lsn,
-                            }))
-                            .await;
+                            if self
+                                .send_event_backpressured(
+                                    stream,
+                                    Ok(ReplicationEvent::StoppedAt {
+                                        reached: reached_lsn,
+                                    }),
+                                    last_status_sent,
+                                )
+                                .await?
+                            {
+                                return Ok(true);
+                            }
                             let _ = write_copy_done(stream).await;
                             return Ok(true); // should stop.
                         }
@@ -392,42 +422,134 @@ impl WorkerState {
                 if let Some(stop_lsn) = self.cfg.stop_at_lsn {
                     if wal_end >= stop_lsn {
                         // Send final event, then stop signal
-                        self.send_event(Ok(ReplicationEvent::XLogData {
-                            wal_start,
-                            wal_end,
-                            server_time_micros,
-                            data,
-                        }))
-                        .await;
+                        if self
+                            .send_event_backpressured(
+                                stream,
+                                Ok(ReplicationEvent::XLogData {
+                                    wal_start,
+                                    wal_end,
+                                    server_time_micros,
+                                    data,
+                                }),
+                                last_status_sent,
+                            )
+                            .await?
+                        {
+                            return Ok(true);
+                        }
 
-                        self.send_event(Ok(ReplicationEvent::StoppedAt { reached: wal_end }))
-                            .await;
+                        if self
+                            .send_event_backpressured(
+                                stream,
+                                Ok(ReplicationEvent::StoppedAt { reached: wal_end }),
+                                last_status_sent,
+                            )
+                            .await?
+                        {
+                            return Ok(true);
+                        }
 
                         let _ = write_copy_done(stream).await;
                         return Ok(true);
                     }
                 }
 
-                self.send_event(Ok(ReplicationEvent::XLogData {
-                    wal_start,
-                    wal_end,
-                    server_time_micros,
-                    data,
-                }))
-                .await;
+                if self
+                    .send_event_backpressured(
+                        stream,
+                        Ok(ReplicationEvent::XLogData {
+                            wal_start,
+                            wal_end,
+                            server_time_micros,
+                            data,
+                        }),
+                        last_status_sent,
+                    )
+                    .await?
+                {
+                    return Ok(true);
+                }
 
                 Ok(false)
             }
         }
     }
 
-    /// Send an event to the client channel.
+    /// Forward an event to the consumer, keeping standby feedback alive under
+    /// backpressure.
     ///
-    /// If the channel is full or closed, we log and continue - the client
-    /// may have stopped listening but we don't want to crash the worker.
-    async fn send_event(&self, event: std::result::Result<ReplicationEvent, PgWireError>) {
-        if self.out.send(event).await.is_err() {
-            tracing::debug!("event channel closed, client may have disconnected");
+    /// Fast path: if the channel has capacity, send immediately — no await, no
+    /// stall. When the channel is full we must **not** block silently on
+    /// `send().await`: that would park the worker and starve standby-status
+    /// feedback until `wal_sender_timeout` fires and the server resets the
+    /// connection. Instead we wait for capacity while continuing to emit
+    /// feedback every `status_interval`, so the server keeps seeing us alive.
+    /// This does not falsely acknowledge data — feedback reports the unchanged
+    /// applied LSN — and real backpressure still propagates via TCP flow
+    /// control (we stop reading the socket while parked here).
+    ///
+    /// Returns `Ok(true)` if a stop was requested while waiting (the caller
+    /// should unwind), or `Ok(false)` once the event is delivered or the
+    /// channel is closed.
+    async fn send_event_backpressured<S: AsyncWrite + Unpin>(
+        &mut self,
+        stream: &mut S,
+        event: std::result::Result<ReplicationEvent, PgWireError>,
+        last_status_sent: &mut Instant,
+    ) -> Result<bool> {
+        // Fast path: capacity available.
+        match self.out.try_reserve() {
+            Ok(permit) => {
+                permit.send(event);
+                self.metrics.record_event_forwarded();
+                return Ok(false);
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                tracing::debug!("event channel closed, client may have disconnected");
+                return Ok(false);
+            }
+            // Channel full: fall through to the backpressure wait loop. `event`
+            // is untouched (try_reserve carries no value), so we still own it.
+            Err(mpsc::error::TrySendError::Full(())) => {}
+        }
+
+        // Counted here, at the start, so an ongoing stall is visible even while
+        // the worker is still parked below awaiting capacity.
+        self.metrics.record_stall_begin();
+        let stall_start = Instant::now();
+        loop {
+            let deadline = *last_status_sent + self.cfg.status_interval;
+            tokio::select! {
+                biased;
+
+                _ = self.stop_rx.changed() => {
+                    if *self.stop_rx.borrow() {
+                        let _ = write_copy_done(stream).await;
+                        return Ok(true);
+                    }
+                }
+
+                permit = self.out.reserve() => {
+                    self.metrics
+                        .record_stall_end(stall_start.elapsed().as_micros() as u64);
+                    match permit {
+                        Ok(permit) => {
+                            permit.send(event);
+                            self.metrics.record_event_forwarded();
+                        }
+                        Err(_closed) => {
+                            tracing::debug!("event channel closed while backpressured");
+                        }
+                    }
+                    return Ok(false);
+                }
+
+                _ = tokio::time::sleep_until(deadline) => {
+                    let applied = self.progress.load_applied();
+                    self.send_feedback(stream, applied, false).await?;
+                    *last_status_sent = Instant::now();
+                }
+            }
         }
     }
 
@@ -552,7 +674,9 @@ impl WorkerState {
     ) -> Result<()> {
         let client_time = current_pg_timestamp();
         let payload = encode_standby_status_update(applied, client_time, reply_requested);
-        write_copy_data(stream, &payload).await
+        write_copy_data(stream, &payload).await?;
+        self.metrics.record_feedback_sent(applied);
+        Ok(())
     }
 }
 
@@ -761,5 +885,98 @@ mod tests {
         // Any time after 2000-01-01 should be positive
         let ts = current_pg_timestamp();
         assert!(ts > 0);
+    }
+
+    /// Build a CopyData('d') frame wrapping an XLogData('w') replication message
+    /// carrying a non-boundary pgoutput payload (so the worker forwards it as a
+    /// raw `XLogData` event).
+    fn xlog_frame(wal_end: u64, data: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(b'w');
+        payload.extend_from_slice(&(wal_end as i64).to_be_bytes()); // wal_start
+        payload.extend_from_slice(&(wal_end as i64).to_be_bytes()); // wal_end
+        payload.extend_from_slice(&0i64.to_be_bytes()); // server_time
+        payload.extend_from_slice(data);
+
+        let mut frame = Vec::new();
+        frame.push(b'd');
+        frame.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Regression test for the keepalive/feedback starvation bug
+    /// (spiceai/spiceai#11616): when the event channel fills and the consumer
+    /// never drains, the worker must keep emitting standby-status feedback so
+    /// the server does not hit `wal_sender_timeout` and reset the connection.
+    #[tokio::test]
+    async fn feedback_continues_under_backpressure() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let cfg = ReplicationConfig {
+            status_interval: Duration::from_millis(40),
+            idle_wakeup_interval: Duration::from_secs(10),
+            buffer_events: 2,
+            ..Default::default()
+        };
+
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let (stop_tx, stop_rx) = watch::channel(false);
+        // Receiver is held but never drained, so the channel stays full.
+        let (tx, _rx_never_drained) = mpsc::channel(cfg.buffer_events);
+        let metrics = Arc::new(ReplicationMetrics::default());
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, tx, Arc::clone(&metrics));
+
+        let (worker_end, mut test_end) = tokio::io::duplex(64 * 1024);
+
+        let worker_task = tokio::spawn(async move {
+            let mut buf = BufReader::with_capacity(1024, worker_end);
+            let _ = worker.stream_loop(&mut buf).await;
+        });
+
+        // Feed more messages than the 2-slot channel can hold; the worker
+        // forwards two, then parks awaiting capacity on the third.
+        for i in 1..=5u64 {
+            test_end.write_all(&xlog_frame(i, b"Idummy")).await.unwrap();
+        }
+        test_end.flush().await.unwrap();
+
+        // A feedback message is a CopyData('d') whose payload is a
+        // StandbyStatusUpdate('r'). Assert several arrive while the channel is
+        // full — i.e. feedback survives backpressure, not just the initial one.
+        let mut reader = MessageReader::new();
+        let mut feedback_count = 0;
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while feedback_count < 3 {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, reader.read(&mut test_end)).await {
+                Ok(Ok(msg)) if msg.tag == b'd' && msg.payload.first() == Some(&b'r') => {
+                    feedback_count += 1;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+
+        assert!(
+            feedback_count >= 3,
+            "expected repeated feedback under backpressure, got {feedback_count}"
+        );
+        assert!(
+            metrics.stall_count() >= 1,
+            "expected at least one stall to be recorded"
+        );
+        assert!(
+            metrics.feedback_sent() >= 3,
+            "feedback_sent metric should track sends, got {}",
+            metrics.feedback_sent()
+        );
+
+        let _ = stop_tx.send(true);
+        let _ = worker_task.await;
     }
 }
