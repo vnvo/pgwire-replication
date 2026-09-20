@@ -169,13 +169,20 @@ impl WorkerState {
 
     /// Send startup message with replication parameters.
     async fn startup<S: AsyncWrite + Unpin>(&self, stream: &mut S) -> Result<()> {
-        let params = [
+        let mut params = vec![
             ("user", self.cfg.user.as_str()),
             ("database", self.cfg.database.as_str()),
             ("replication", "database"),
             ("client_encoding", "UTF8"),
             ("application_name", "pgwire-replication"),
         ];
+        // PostgreSQL honors `options` on replication connections the same as on
+        // ordinary ones, so this lets callers pin session GUCs (e.g. `DateStyle`,
+        // `IntervalStyle`) the way they already can via a normal libpq `options`
+        // parameter — only sent when the caller actually set one.
+        if let Some(options) = self.cfg.options.as_deref() {
+            params.push(("options", options));
+        }
         write_startup_message(stream, 196608, &params).await
     }
 
@@ -927,6 +934,57 @@ mod tests {
         let metrics = Arc::new(ReplicationMetrics::default());
         let worker = WorkerState::new(cfg, progress, stop_rx, tx, metrics);
         (worker, stop_tx, rx)
+    }
+
+    /// The `options` startup parameter is how `libpq`/`PGOPTIONS` lets a caller
+    /// pin session GUCs (e.g. `DateStyle`, `IntervalStyle`) on a connection.
+    /// PostgreSQL honors it on replication connections too, so it must be
+    /// forwarded into the startup message when the caller sets it, and left
+    /// out entirely otherwise (server defaults apply).
+    #[tokio::test]
+    async fn startup_includes_options_when_set() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+            .with_options("-c datestyle=ISO,MDY -c intervalstyle=iso_8601");
+        let (worker, _stop_tx, _rx) = test_worker(cfg);
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+
+        worker.startup(&mut worker_end).await.unwrap();
+        worker_end.shutdown().await.unwrap();
+
+        let mut sent = Vec::new();
+        server.read_to_end(&mut sent).await.unwrap();
+        let sent = String::from_utf8_lossy(&sent);
+
+        assert!(
+            sent.contains("options"),
+            "startup message missing 'options' key: {sent:?}"
+        );
+        assert!(
+            sent.contains("-c datestyle=ISO,MDY -c intervalstyle=iso_8601"),
+            "startup message missing options value: {sent:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_omits_options_when_unset() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (worker, _stop_tx, _rx) = test_worker(ReplicationConfig::default());
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+
+        worker.startup(&mut worker_end).await.unwrap();
+        worker_end.shutdown().await.unwrap();
+
+        let mut sent = Vec::new();
+        server.read_to_end(&mut sent).await.unwrap();
+        let sent = String::from_utf8_lossy(&sent);
+
+        assert!(
+            !sent.contains("options"),
+            "startup message should omit 'options' when unset: {sent:?}"
+        );
     }
 
     #[tokio::test]

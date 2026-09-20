@@ -414,6 +414,23 @@ pub struct ReplicationConfig {
     ///
     /// Default: `false`
     pub binary: bool,
+
+    /// Value for the startup `options` parameter, passed through to the
+    /// server the same way `libpq`'s `options` connection parameter (or the
+    /// `PGOPTIONS` environment variable) would on an ordinary connection.
+    ///
+    /// PostgreSQL honors `options` on replication connections too, so this
+    /// is typically used to pin session GUCs (e.g.
+    /// `"-c datestyle=ISO,MDY -c intervalstyle=iso_8601"`) so that values
+    /// decoded from the replication stream are rendered in text the same
+    /// way as values read through a regular connection whose GUCs are also
+    /// pinned.
+    ///
+    /// See [`PGOPTIONS`](https://www.postgresql.org/docs/current/libpq-envars.html)
+    /// for the `-c name=value` syntax.
+    ///
+    /// Default: `None` (server defaults apply).
+    pub options: Option<String>,
 }
 
 impl Default for ReplicationConfig {
@@ -433,6 +450,7 @@ impl Default for ReplicationConfig {
             idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
             binary: false,
+            options: None,
         }
     }
 }
@@ -592,6 +610,25 @@ impl ReplicationConfig {
         self
     }
 
+    /// Set the startup `options` parameter (equivalent to `libpq`'s `options`
+    /// connection parameter / `PGOPTIONS`).
+    ///
+    /// # Example
+    /// ```
+    /// use pgwire_replication::config::ReplicationConfig;
+    ///
+    /// let config = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+    ///     .with_options("-c datestyle=ISO,MDY -c intervalstyle=iso_8601");
+    /// assert_eq!(
+    ///     config.options.as_deref(),
+    ///     Some("-c datestyle=ISO,MDY -c intervalstyle=iso_8601")
+    /// );
+    /// ```
+    pub fn with_options(mut self, options: impl Into<String>) -> Self {
+        self.options = Some(options.into());
+        self
+    }
+
     /// Returns the connection string for display (password masked).
     ///
     /// Useful for logging without exposing credentials.
@@ -717,6 +754,14 @@ mod tests {
         assert!(!ReplicationConfig::default().binary);
         let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub").with_binary(true);
         assert!(cfg.binary);
+    }
+
+    #[test]
+    fn options_defaults_none_and_builder_sets_it() {
+        assert_eq!(ReplicationConfig::default().options, None);
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+            .with_options("-c datestyle=ISO,MDY");
+        assert_eq!(cfg.options.as_deref(), Some("-c datestyle=ISO,MDY"));
     }
 
     #[test]

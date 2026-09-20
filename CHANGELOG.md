@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Startup `options` parameter**: `ReplicationConfig::options` / `with_options()` let callers set the startup `options` parameter on the replication connection, the same as `libpq`'s `options` connection parameter (or `PGOPTIONS`) on an ordinary connection. PostgreSQL honors `options` on replication connections too, so this is useful for pinning session GUCs (e.g. `DateStyle`, `IntervalStyle`) so that values decoded from the replication stream are rendered the same way as values read through a regular connection with the same GUCs pinned. Omitted from the startup message entirely when unset, so behavior is unchanged by default.
+
+---
+
 ## [0.4.0] - 2026-07-14
 
 ### Added
