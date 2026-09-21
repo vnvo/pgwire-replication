@@ -58,6 +58,7 @@ pgwire-replication = { version = "0.4.0", default-features = false, features = [
 - Tokio-based async client
 - SCRAM-SHA-256 and MD5 authentication
 - TLS/mTLS support (via rustls)
+- Connection-level configs via the startup `options` parameter (e.g. pin `TimeZone`/`IntervalStyle`/`DateStyle` for deterministic decoded output)
 - Unix domain socket connections (libpq-compatible: host starts with `/`)
 - Designed for checkpoint and replay-based systems
 
