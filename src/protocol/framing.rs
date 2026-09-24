@@ -101,10 +101,11 @@ impl MessageReader {
     /// Refuse any message whose payload is larger than `max` bytes.
     ///
     /// The payload buffer is sized from the length the server announces, so
-    /// this bounds the memory a single message can take. Defaults to
-    /// [`MAX_MESSAGE_SIZE`].
+    /// this bounds the memory a single message can take. It can only lower
+    /// the limit: a value above [`MAX_MESSAGE_SIZE`], the default, is capped
+    /// to it.
     pub fn with_max_message_size(mut self, max: usize) -> Self {
-        self.max_payload = max;
+        self.max_payload = max.min(MAX_MESSAGE_SIZE);
         self
     }
 
@@ -483,6 +484,12 @@ mod tests {
         let mut reader = MessageReader::new().with_max_message_size(8);
         let msg = reader.read(&mut cursor).await.unwrap();
         assert_eq!(&msg.payload[..], b"12345678");
+    }
+
+    #[test]
+    fn message_reader_limit_cannot_be_raised_above_the_protocol_cap() {
+        let reader = MessageReader::new().with_max_message_size(usize::MAX);
+        assert_eq!(reader.max_payload, MAX_MESSAGE_SIZE);
     }
 
     #[tokio::test]
