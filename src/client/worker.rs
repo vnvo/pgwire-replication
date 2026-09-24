@@ -235,7 +235,7 @@ impl WorkerState {
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
         let mut last_applied = self.progress.load_applied();
         // Cancellation-safe message reader, partial reads survive dropped futures.
-        let mut reader = MessageReader::new();
+        let mut reader = MessageReader::new().with_max_message_size(self.cfg.max_message_size);
         // How many messages to process in the tight loop before checking
         // stop signal and sending periodic status feedback.
         const DRAIN_BATCH: usize = 256;
