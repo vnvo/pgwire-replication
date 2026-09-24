@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Configurable message size limit**: `ReplicationConfig::max_message_size` / `with_max_message_size()` bound the largest replication message the worker accepts. The payload buffer is sized from the length the server announces, so this caps the memory a single message can take; a larger message ends the stream with a protocol error. `MessageReader::with_max_message_size()` exposes the same limit for direct use. Defaults to the existing 1 GiB `MAX_MESSAGE_SIZE`, so behavior is unchanged unless set. The setting can only lower the limit: a larger value is capped to `MAX_MESSAGE_SIZE`.
+
+---
+
 ## [0.4.1] - 2026-09-21
 
 ### Added

@@ -6,6 +6,9 @@ use crate::error::{PgWireError, Result};
 
 /// Maximum backend message size (1GB) - prevents memory exhaustion from malformed length fields
 /// This is more than enough.
+///
+/// The default for [`MessageReader`] and for
+/// [`ReplicationConfig::max_message_size`](crate::config::ReplicationConfig::max_message_size).
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +76,9 @@ pub struct MessageReader {
     /// `None` after each completed message.
     payload_len: Option<usize>,
     tag: u8,
+    /// Largest payload accepted; a longer message is refused before any of
+    /// it is buffered.
+    max_payload: usize,
 }
 
 impl MessageReader {
@@ -88,7 +94,19 @@ impl MessageReader {
             payload_filled: 0,
             payload_len: None,
             tag: 0,
+            max_payload: MAX_MESSAGE_SIZE,
         }
+    }
+
+    /// Refuse any message whose payload is larger than `max` bytes.
+    ///
+    /// The payload buffer is sized from the length the server announces, so
+    /// this bounds the memory a single message can take. It can only lower
+    /// the limit: a value above [`MAX_MESSAGE_SIZE`], the default, is capped
+    /// to it.
+    pub fn with_max_message_size(mut self, max: usize) -> Self {
+        self.max_payload = max.min(MAX_MESSAGE_SIZE);
+        self
     }
 
     /// Read the next complete backend message.
@@ -123,10 +141,11 @@ impl MessageReader {
 
             let payload_len = (len - 4) as usize;
 
-            if payload_len > MAX_MESSAGE_SIZE {
+            if payload_len > self.max_payload {
                 self.hdr_filled = 0;
                 return Err(PgWireError::Protocol(format!(
-                    "backend message too large: {payload_len} bytes (max {MAX_MESSAGE_SIZE})"
+                    "backend message too large: {payload_len} bytes (max {})",
+                    self.max_payload
                 )));
             }
 
@@ -442,6 +461,35 @@ mod tests {
         let mut reader = MessageReader::new();
         let err = reader.read(&mut cursor).await.unwrap_err();
         assert!(err.to_string().contains("invalid backend message length"));
+    }
+
+    #[tokio::test]
+    async fn message_reader_rejects_a_message_over_its_configured_limit() {
+        // A 10-byte payload against a limit of 8.
+        let data = [b'd', 0, 0, 0, 14];
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        let err = reader.read(&mut cursor).await.unwrap_err();
+        assert!(err.to_string().contains("too large"));
+        assert!(err.to_string().contains("max 8"));
+    }
+
+    #[tokio::test]
+    async fn message_reader_accepts_a_message_at_its_configured_limit() {
+        let mut data = vec![b'd', 0, 0, 0, 12];
+        data.extend_from_slice(b"12345678");
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        let msg = reader.read(&mut cursor).await.unwrap();
+        assert_eq!(&msg.payload[..], b"12345678");
+    }
+
+    #[test]
+    fn message_reader_limit_cannot_be_raised_above_the_protocol_cap() {
+        let reader = MessageReader::new().with_max_message_size(usize::MAX);
+        assert_eq!(reader.max_payload, MAX_MESSAGE_SIZE);
     }
 
     #[tokio::test]
