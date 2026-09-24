@@ -643,6 +643,10 @@ impl ReplicationConfig {
 
     /// Set the largest replication message accepted, in bytes.
     ///
+    /// This can only lower the limit: a value above
+    /// [`MAX_MESSAGE_SIZE`](crate::protocol::framing::MAX_MESSAGE_SIZE) is
+    /// capped to it.
+    ///
     /// # Example
     /// ```
     /// use pgwire_replication::config::ReplicationConfig;
@@ -652,7 +656,7 @@ impl ReplicationConfig {
     /// assert_eq!(config.max_message_size, 64 * 1024 * 1024);
     /// ```
     pub fn with_max_message_size(mut self, bytes: usize) -> Self {
-        self.max_message_size = bytes;
+        self.max_message_size = bytes.min(crate::protocol::framing::MAX_MESSAGE_SIZE);
         self
     }
 
@@ -792,6 +796,16 @@ mod tests {
         let cfg =
             ReplicationConfig::new("h", "u", "p", "db", "slot", "pub").with_max_message_size(1024);
         assert_eq!(cfg.max_message_size, 1024);
+    }
+
+    #[test]
+    fn max_message_size_cannot_be_raised_above_the_protocol_limit() {
+        let cfg = ReplicationConfig::new("h", "u", "p", "db", "slot", "pub")
+            .with_max_message_size(usize::MAX);
+        assert_eq!(
+            cfg.max_message_size,
+            crate::protocol::framing::MAX_MESSAGE_SIZE
+        );
     }
 
     #[test]
