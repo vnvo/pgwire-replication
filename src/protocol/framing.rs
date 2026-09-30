@@ -6,6 +6,9 @@ use crate::error::{PgWireError, Result};
 
 /// Maximum backend message size (1GB) - prevents memory exhaustion from malformed length fields
 /// This is more than enough.
+///
+/// The default for [`MessageReader`] and for
+/// [`ReplicationConfig::max_message_size`](crate::config::ReplicationConfig::max_message_size).
 pub const MAX_MESSAGE_SIZE: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +76,13 @@ pub struct MessageReader {
     /// `None` after each completed message.
     payload_len: Option<usize>,
     tag: u8,
+    /// Largest payload accepted; a longer message is refused before any of
+    /// it is buffered.
+    max_payload: usize,
+    /// Bytes of a refused message's payload still on the wire. They are
+    /// read and dropped before the next header, so the reader stays aligned
+    /// with the stream after the refusal.
+    skip_remaining: usize,
 }
 
 impl MessageReader {
@@ -88,7 +98,20 @@ impl MessageReader {
             payload_filled: 0,
             payload_len: None,
             tag: 0,
+            max_payload: MAX_MESSAGE_SIZE,
+            skip_remaining: 0,
         }
+    }
+
+    /// Refuse any message whose payload is larger than `max` bytes.
+    ///
+    /// The payload buffer is sized from the length the server announces, so
+    /// this bounds the memory a single message can take. It can only lower
+    /// the limit: a value above [`MAX_MESSAGE_SIZE`], the default, is capped
+    /// to it.
+    pub fn with_max_message_size(mut self, max: usize) -> Self {
+        self.max_payload = max.min(MAX_MESSAGE_SIZE);
+        self
     }
 
     /// Read the next complete backend message.
@@ -96,6 +119,21 @@ impl MessageReader {
     /// Cancellation-safe: dropping the returned future preserves all progress
     /// so far on `self`. Re-call to resume.
     pub async fn read<R: AsyncRead + Unpin>(&mut self, rd: &mut R) -> Result<BackendMessage> {
+        // Phase 0: drop what is left of a refused message, without buffering
+        // it, so the next header is read from where it actually starts.
+        while self.skip_remaining > 0 {
+            let mut scratch = [0u8; 8192];
+            let want = self.skip_remaining.min(scratch.len());
+            let n = rd.read(&mut scratch[..want]).await?;
+            if n == 0 {
+                return Err(PgWireError::Io(std::sync::Arc::new(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF while skipping a refused backend message",
+                ))));
+            }
+            self.skip_remaining -= n;
+        }
+
         // Phase 1: fill the 5-byte header
         while self.hdr_filled < 5 {
             let n = rd.read(&mut self.hdr[self.hdr_filled..]).await?;
@@ -123,10 +161,14 @@ impl MessageReader {
 
             let payload_len = (len - 4) as usize;
 
-            if payload_len > MAX_MESSAGE_SIZE {
+            if payload_len > self.max_payload {
+                // The payload is still on the wire: skip it on the next read
+                // rather than parse a header from the middle of it.
                 self.hdr_filled = 0;
+                self.skip_remaining = payload_len;
                 return Err(PgWireError::Protocol(format!(
-                    "backend message too large: {payload_len} bytes (max {MAX_MESSAGE_SIZE})"
+                    "backend message too large: {payload_len} bytes (max {})",
+                    self.max_payload
                 )));
             }
 
@@ -442,6 +484,99 @@ mod tests {
         let mut reader = MessageReader::new();
         let err = reader.read(&mut cursor).await.unwrap_err();
         assert!(err.to_string().contains("invalid backend message length"));
+    }
+
+    #[tokio::test]
+    async fn message_reader_rejects_a_message_over_its_configured_limit() {
+        // A 10-byte payload against a limit of 8.
+        let data = [b'd', 0, 0, 0, 14];
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        let err = reader.read(&mut cursor).await.unwrap_err();
+        assert!(err.to_string().contains("too large"));
+        assert!(err.to_string().contains("max 8"));
+    }
+
+    #[tokio::test]
+    async fn message_reader_stays_aligned_after_refusing_an_oversized_message() {
+        // A 10-byte payload over the limit of 8, then a valid message.
+        let mut data = vec![b'd', 0, 0, 0, 14];
+        data.extend_from_slice(b"0123456789");
+        data.extend_from_slice(&[b'k', 0, 0, 0, 7]);
+        data.extend_from_slice(b"abc");
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        assert!(reader.read(&mut cursor).await.is_err());
+
+        let msg = reader.read(&mut cursor).await.unwrap();
+        assert_eq!(msg.tag, b'k');
+        assert_eq!(&msg.payload[..], b"abc");
+    }
+
+    /// Hands out at most `chunk` bytes per read, as a socket does.
+    struct ShortReads {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl AsyncRead for ShortReads {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            let n = self
+                .chunk
+                .min(buf.remaining())
+                .min(self.data.len() - self.pos);
+            let start = self.pos;
+            buf.put_slice(&self.data[start..start + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn message_reader_skips_a_refused_payload_across_short_reads() {
+        // The refused payload arrives in small pieces and is dropped across
+        // them, larger than the skip buffer, before the next message.
+        let mut data = vec![b'd'];
+        data.extend_from_slice(&(4 + 20_000i32).to_be_bytes());
+        data.extend(vec![b'x'; 20_000]);
+        data.extend_from_slice(&[b'k', 0, 0, 0, 5]);
+        data.push(b'z');
+        let mut stream = ShortReads {
+            data,
+            pos: 0,
+            chunk: 3_000,
+        };
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        assert!(reader.read(&mut stream).await.is_err());
+
+        let msg = reader.read(&mut stream).await.unwrap();
+        assert_eq!(msg.tag, b'k');
+        assert_eq!(&msg.payload[..], b"z");
+    }
+
+    #[tokio::test]
+    async fn message_reader_accepts_a_message_at_its_configured_limit() {
+        let mut data = vec![b'd', 0, 0, 0, 12];
+        data.extend_from_slice(b"12345678");
+        let mut cursor = Cursor::new(&data[..]);
+
+        let mut reader = MessageReader::new().with_max_message_size(8);
+        let msg = reader.read(&mut cursor).await.unwrap();
+        assert_eq!(&msg.payload[..], b"12345678");
+    }
+
+    #[test]
+    fn message_reader_limit_cannot_be_raised_above_the_protocol_cap() {
+        let reader = MessageReader::new().with_max_message_size(usize::MAX);
+        assert_eq!(reader.max_payload, MAX_MESSAGE_SIZE);
     }
 
     #[tokio::test]
