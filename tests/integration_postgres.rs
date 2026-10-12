@@ -612,6 +612,90 @@ async fn postgres_replication_batch_insert() -> Result<()> {
     Ok(())
 }
 
+/// The slot's confirmed_flush_lsn, read from the server.
+async fn confirmed_flush(client: &tokio_postgres::Client, slot: &str) -> Result<Lsn> {
+    let row = client
+        .query_one(
+            "SELECT confirmed_flush_lsn::text FROM pg_replication_slots WHERE slot_name = $1",
+            &[&slot],
+        )
+        .await?;
+    Lsn::parse(&row.get::<_, String>(0)).context("parse confirmed_flush_lsn")
+}
+
+/// On an idle stream, an applied LSN reaches the server within
+/// `status_interval`, not at the next idle wakeup or server keepalive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_idle_feedback_is_change_driven() -> Result<()> {
+    init_tracing();
+
+    let host_port: u16 = std::env::var("PG_ITEST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(get_available_port);
+    let container = postgres_image(host_port)
+        .start()
+        .await
+        .expect("start postgres");
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+    setup_publication_and_slot(&client, "slot_fb", "pub_fb").await?;
+    let base_lsn = current_wal_lsn(&client).await?;
+
+    // status_interval 1 s, idle wakeup 15 s.
+    let mut repl = ReplicationClient::connect(replication_config(
+        host_port, "slot_fb", "pub_fb", base_lsn, None,
+    ))
+    .await?;
+    recv_keepalive(&mut repl, Duration::from_secs(10)).await?;
+
+    client
+        .execute("INSERT INTO t(id, v) VALUES (1, 'a')", &[])
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let commit_end = loop {
+        anyhow::ensure!(Instant::now() < deadline, "no commit received");
+        match tokio::time::timeout(Duration::from_secs(1), repl.recv()).await {
+            Ok(Ok(Some(ReplicationEvent::Commit { end_lsn, .. }))) => break end_lsn,
+            Ok(Ok(Some(_))) | Err(_) => {}
+            Ok(Ok(None)) => anyhow::bail!("stream ended"),
+            Ok(Err(e)) => return Err(e.into()),
+        }
+    };
+
+    // Not acknowledged yet: the slot stays behind the commit.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let before = confirmed_flush(&client, "slot_fb").await?;
+    anyhow::ensure!(
+        before < commit_end,
+        "slot advanced to {before} before the commit {commit_end} was acknowledged"
+    );
+
+    // Acknowledge on the idle stream; the server sees it within the interval.
+    let acked = Instant::now();
+    repl.update_applied_lsn(commit_end);
+    loop {
+        let flushed = confirmed_flush(&client, "slot_fb").await?;
+        if flushed >= commit_end {
+            break;
+        }
+        anyhow::ensure!(
+            acked.elapsed() < Duration::from_secs(2),
+            "confirmed_flush_lsn {flushed} did not reach {commit_end} within 2 s"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    info!(
+        "confirmed_flush_lsn reached the acknowledged commit in {:?}",
+        acked.elapsed()
+    );
+
+    repl.stop();
+    let _ = repl.join().await;
+    Ok(())
+}
+
 /// Test error handling: connecting with a nonexistent slot should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_replication_invalid_slot_error() -> Result<()> {

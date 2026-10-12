@@ -157,8 +157,9 @@ impl ReplicationClient {
     /// Update the applied/durable LSN reported to the server.
     ///
     /// Semantics: call this only once you have durably persisted all events up to `lsn`.
-    /// This update is monotonic and cheap; wire feedback is still governed by the worker’s
-    /// `status_interval` and keepalive reply requests.
+    /// This update is monotonic and cheap. A raised LSN wakes the worker, which sends it
+    /// once `status_interval` has passed since its last standby status update, also on an
+    /// idle stream; updates in between coalesce into one status carrying the newest LSN.
     #[inline]
     pub fn update_applied_lsn(&self, lsn: Lsn) {
         self.progress.update_applied(lsn);
