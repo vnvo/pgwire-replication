@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+- **Change-driven standby feedback**: `update_applied_lsn` now wakes the worker, which sends the new applied LSN once `status_interval` has passed since its last standby status update, also on an idle stream. Previously an idle stream reported it only at the next `idle_wakeup_interval` wakeup, server message or keepalive reply request, so a consumer acknowledging after traffic stopped could hold WAL for that long. Updates coalesce into one status carrying the newest LSN; no wakeup is added while nothing new is pending, and `update_applied_lsn` stays a compare-and-swap plus one atomic load except for the first raise after the worker last looked. Keepalive replies, idle wakeup feedback and feedback under backpressure are unchanged.
+
+---
+
 ## [0.4.1] - 2026-09-21
 
 ### Added

@@ -73,6 +73,7 @@ tracing-subscriber = { version = "0.3", optional = true, features = [
 
 [dev-dependencies]
 hex = "0.4"
+tokio = { version = "1", features = ["test-util"] }
 proptest = "1"
 tempfile = "3"
 tokio-postgres = "0.7"

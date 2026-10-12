@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
@@ -20,16 +20,24 @@ use crate::protocol::replication::{
 
 /// Shared replication progress updated by the consumer and read by the worker.
 ///
-/// Stored as an AtomicU64 so progress updates are cheap and monotonic
-/// without async backpressure.
+/// The applied LSN is an AtomicU64 so progress updates are cheap and monotonic
+/// without async backpressure. A raise also wakes an idle worker, which sends
+/// it promptly instead of at its next wakeup. Only the first raise after the
+/// worker last looked bumps the watch generation; later ones coalesce into it
+/// and cost one more atomic load.
 pub struct SharedProgress {
     applied: AtomicU64,
+    /// Set by the first raise the worker has not looked at yet.
+    signalled: AtomicBool,
+    changed: watch::Sender<u64>,
 }
 
 impl SharedProgress {
     pub fn new(start: Lsn) -> Self {
         Self {
             applied: AtomicU64::new(start.as_u64()),
+            signalled: AtomicBool::new(false),
+            changed: watch::Sender::new(0),
         }
     }
 
@@ -46,14 +54,35 @@ impl SharedProgress {
         let mut cur = self.applied.load(Ordering::Relaxed);
 
         while new > cur {
+            // SeqCst pairs with `take_signal`: either the worker reads this
+            // raise, or this raise sees the signal cleared and wakes it.
             match self
                 .applied
-                .compare_exchange_weak(cur, new, Ordering::Release, Ordering::Relaxed)
+                .compare_exchange_weak(cur, new, Ordering::SeqCst, Ordering::Relaxed)
             {
-                Ok(_) => break,
+                Ok(_) => {
+                    if !self.signalled.load(Ordering::Relaxed)
+                        && !self.signalled.swap(true, Ordering::SeqCst)
+                    {
+                        self.changed.send_modify(|g| *g = g.wrapping_add(1));
+                    }
+                    break;
+                }
                 Err(observed) => cur = observed,
             }
         }
+    }
+
+    /// Wakes when the applied LSN is raised.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// The worker is about to read the applied LSN: the next raise wakes it
+    /// again. Returns the applied LSN read after clearing the signal.
+    fn take_signal(&self) -> Lsn {
+        self.signalled.store(false, Ordering::SeqCst);
+        Lsn::from_u64(self.applied.load(Ordering::SeqCst))
     }
 }
 
@@ -133,6 +162,8 @@ pub struct WorkerState {
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
     metrics: Arc<ReplicationMetrics>,
+    /// The applied LSN in the last status update written to the server, if any.
+    last_sent: Option<Lsn>,
 }
 
 impl WorkerState {
@@ -149,6 +180,7 @@ impl WorkerState {
             stop_rx,
             out,
             metrics,
+            last_sent: None,
         }
     }
 
@@ -234,6 +266,8 @@ impl WorkerState {
     ) -> Result<()> {
         let mut last_status_sent = Instant::now() - self.cfg.status_interval;
         let mut last_applied = self.progress.load_applied();
+        // Wakes the wait phase when the consumer raises the applied LSN.
+        let mut applied_rx = self.progress.subscribe();
         // Cancellation-safe message reader, partial reads survive dropped futures.
         let mut reader = MessageReader::new();
         // How many messages to process in the tight loop before checking
@@ -295,6 +329,16 @@ impl WorkerState {
             // mid-message. `MessageReader::read` is cancellation-safe — partial
             // header/payload state lives on `reader` and is preserved across the
             // drop, so the next iteration resumes the read without losing bytes.
+            //
+            // An applied LSN newer than the last one sent is pending: it is sent
+            // once `status_interval` has passed since the last status update.
+            // Otherwise a raise wakes the loop. Marking the watch seen and
+            // clearing the signal before reading the LSN means a raise after
+            // this point still wakes it.
+            applied_rx.mark_unchanged();
+            let applied = self.progress.take_signal();
+            let pending = self.last_sent.is_none_or(|sent| applied > sent);
+            let feedback_due = last_status_sent + self.cfg.status_interval;
             let msg = tokio::select! {
                 biased;
 
@@ -305,6 +349,17 @@ impl WorkerState {
                     }
                     continue;
                 }
+
+                _ = tokio::time::sleep_until(feedback_due), if pending => {
+                    let applied = self.progress.load_applied();
+                    last_applied = applied;
+                    self.send_feedback(stream, applied, false).await?;
+                    last_status_sent = Instant::now();
+                    continue;
+                }
+
+                // The sender lives in `self.progress`, so this never closes.
+                _ = applied_rx.changed(), if !pending => continue,
 
                 msg_result = tokio::time::timeout(
                     self.cfg.idle_wakeup_interval,
@@ -540,6 +595,7 @@ impl WorkerState {
                         let _ = write_copy_done(stream).await;
                         return Ok(true);
                     }
+                    continue;
                 }
 
                 permit = self.out.reserve() => {
@@ -557,12 +613,12 @@ impl WorkerState {
                     return Ok(false);
                 }
 
-                _ = tokio::time::sleep_until(deadline) => {
-                    let applied = self.progress.load_applied();
-                    self.send_feedback(stream, applied, false).await?;
-                    *last_status_sent = Instant::now();
-                }
+                _ = tokio::time::sleep_until(deadline) => {}
             }
+            // The status interval elapsed while parked.
+            let applied = self.progress.load_applied();
+            self.send_feedback(stream, applied, false).await?;
+            *last_status_sent = Instant::now();
         }
     }
 
@@ -679,8 +735,11 @@ impl WorkerState {
     }
 
     /// Send standby status update to server.
+    ///
+    /// The position is recorded as sent only once the write succeeded, so a
+    /// failed send leaves it pending.
     async fn send_feedback<S: AsyncWrite + Unpin>(
-        &self,
+        &mut self,
         stream: &mut S,
         applied: Lsn,
         reply_requested: bool,
@@ -688,6 +747,7 @@ impl WorkerState {
         let client_time = current_pg_timestamp();
         let payload = encode_standby_status_update(applied, client_time, reply_requested);
         write_copy_data(stream, &payload).await?;
+        self.last_sent = Some(applied);
         self.metrics.record_feedback_sent(applied);
         Ok(())
     }
@@ -1169,5 +1229,311 @@ mod tests {
 
         let _ = stop_tx.send(true);
         let _ = worker_task.await;
+    }
+
+    // ── Change-driven standby status updates ──────────────────────────────
+
+    /// A KeepAlive ('k') CopyData frame.
+    fn keepalive_frame(wal_end: u64, reply_requested: bool) -> Vec<u8> {
+        let mut payload = vec![b'k'];
+        payload.extend_from_slice(&(wal_end as i64).to_be_bytes());
+        payload.extend_from_slice(&0i64.to_be_bytes());
+        payload.push(u8::from(reply_requested));
+        let mut frame = vec![b'd'];
+        frame.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// A status update read by the scripted server.
+    #[derive(Debug, PartialEq)]
+    struct Status {
+        applied: u64,
+        reply: bool,
+    }
+
+    /// The scripted server end of a worker's stream.
+    struct Server {
+        end: tokio::io::DuplexStream,
+        reader: MessageReader,
+    }
+
+    impl Server {
+        /// The next standby status update, skipping anything else.
+        async fn status(&mut self) -> Status {
+            loop {
+                let msg = self.reader.read(&mut self.end).await.expect("stream open");
+                if msg.tag == b'd' && msg.payload.first() == Some(&b'r') {
+                    let p = &msg.payload;
+                    return Status {
+                        applied: u64::from_be_bytes(p[1..9].try_into().unwrap()),
+                        reply: p[33] == 1,
+                    };
+                }
+            }
+        }
+
+        /// No status update arrives within `within`.
+        async fn quiet(&mut self, within: std::time::Duration) -> bool {
+            tokio::time::timeout(within, self.status()).await.is_err()
+        }
+
+        async fn send(&mut self, frame: &[u8]) {
+            use tokio::io::AsyncWriteExt;
+            self.end.write_all(frame).await.unwrap();
+            self.end.flush().await.unwrap();
+        }
+    }
+
+    struct Running {
+        server: Server,
+        task: tokio::task::JoinHandle<Result<()>>,
+        stop: watch::Sender<bool>,
+        _events: mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>,
+    }
+
+    fn feedback_cfg() -> ReplicationConfig {
+        ReplicationConfig {
+            status_interval: std::time::Duration::from_secs(1),
+            idle_wakeup_interval: std::time::Duration::from_secs(10),
+            ..Default::default()
+        }
+    }
+
+    /// Run `stream_loop` against a scripted server over a duplex of `capacity`
+    /// bytes.
+    fn run_stream(progress: &Arc<SharedProgress>, capacity: usize) -> Running {
+        run_stream_with(feedback_cfg(), progress, capacity)
+    }
+
+    fn run_stream_with(
+        cfg: ReplicationConfig,
+        progress: &Arc<SharedProgress>,
+        capacity: usize,
+    ) -> Running {
+        let (stop, stop_rx) = watch::channel(false);
+        let (tx, events) = mpsc::channel(16);
+        let mut worker = WorkerState::new(
+            cfg,
+            Arc::clone(progress),
+            stop_rx,
+            tx,
+            Arc::new(ReplicationMetrics::default()),
+        );
+        let (worker_end, end) = tokio::io::duplex(capacity);
+        let task = tokio::spawn(async move {
+            let mut buf = BufReader::with_capacity(1024, worker_end);
+            worker.stream_loop(&mut buf).await
+        });
+        Running {
+            server: Server {
+                end,
+                reader: MessageReader::new(),
+            },
+            task,
+            stop,
+            _events: events,
+        }
+    }
+
+    const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
+
+    #[tokio::test(start_paused = true)]
+    async fn an_update_is_sent_within_the_status_interval() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 0,
+                reply: false
+            }
+        );
+        // Idle with nothing new: no status before the idle wakeup.
+        assert!(r.server.quiet(3 * SECOND).await);
+
+        // The interval since the last status has passed: sent at once.
+        let t = Instant::now();
+        progress.update_applied(Lsn(100));
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 100,
+                reply: false
+            }
+        );
+        assert!(t.elapsed() < SECOND);
+
+        // The next one waits for the interval, no longer.
+        progress.update_applied(Lsn(200));
+        let t = Instant::now();
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 200,
+                reply: false
+            }
+        );
+        assert!(t.elapsed() <= SECOND, "took {:?}", t.elapsed());
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_updates_send_the_newest_once() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        let t = Instant::now();
+        for lsn in 1..=100 {
+            progress.update_applied(Lsn(lsn));
+        }
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 100,
+                reply: false
+            }
+        );
+        assert!(t.elapsed() <= SECOND);
+        // Nothing else until the idle wakeup.
+        assert!(r.server.quiet(8 * SECOND).await);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_update_during_a_send_stays_pending() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        // Too small for one status message: the first send blocks mid-write.
+        let mut r = run_stream(&progress, 8);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        progress.update_applied(Lsn(300));
+        // The blocked send carries the position loaded before the update...
+        assert_eq!(r.server.status().await.applied, 0);
+        // ...and the update follows within the interval.
+        let t = Instant::now();
+        assert_eq!(r.server.status().await.applied, 300);
+        assert!(t.elapsed() <= SECOND);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_session_starts_with_the_newest_position() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        progress.update_applied(Lsn(500));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 500);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_send_leaves_the_position_for_the_next_session() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        progress.update_applied(Lsn(700));
+        // The server goes away before the pending status is written.
+        drop(r.server);
+        let ended = tokio::time::timeout(2 * SECOND, r.task).await.unwrap();
+        assert!(ended.unwrap().is_err(), "the failed send ends the session");
+        let mut next = run_stream(&progress, 64 * 1024);
+        assert_eq!(next.server.status().await.applied, 700);
+        next.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_keepalive_requesting_a_reply_is_answered_at_once() {
+        let progress = Arc::new(SharedProgress::new(Lsn(40)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 40);
+        // No local change, inside the status interval.
+        let t = Instant::now();
+        r.server.send(&keepalive_frame(90, true)).await;
+        assert_eq!(
+            r.server.status().await,
+            Status {
+                applied: 40,
+                reply: true
+            }
+        );
+        assert!(t.elapsed() < SECOND);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_completely_idle_connection_keeps_sending_status() {
+        let progress = Arc::new(SharedProgress::new(Lsn(10)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        let t = Instant::now();
+        let mut statuses = 0;
+        while t.elapsed() < std::time::Duration::from_secs(65) {
+            assert_eq!(r.server.status().await.applied, 10);
+            statuses += 1;
+        }
+        // One at start, then one per idle wakeup (10 s): not none, which
+        // would let wal_sender_timeout disconnect, and not one per interval.
+        assert!((6..=8).contains(&statuses), "{statuses} statuses in 65 s");
+        assert!(!r.task.is_finished());
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stopping_with_the_timer_armed_ends_at_once() {
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream(&progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        progress.update_applied(Lsn(900)); // pending until the interval passes
+        let t = Instant::now();
+        r.stop.send(true).unwrap();
+        let ended = tokio::time::timeout(SECOND, r.task)
+            .await
+            .expect("the worker ends without waiting for the timer");
+        assert!(ended.unwrap().is_ok());
+        assert!(t.elapsed() < SECOND);
+    }
+
+    /// Raises from another thread race the worker clearing its signal and
+    /// reading the position: whatever the interleaving, the newest position of
+    /// every burst is sent within the status interval once the burst ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn racing_raises_never_strand_the_newest_position() {
+        use std::time::Duration;
+        let interval = Duration::from_millis(50);
+        let cfg = ReplicationConfig {
+            status_interval: interval,
+            idle_wakeup_interval: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let mut r = run_stream_with(cfg, &progress, 64 * 1024);
+        let mut newest = 0u64;
+        for burst in 0..50u64 {
+            let p = Arc::clone(&progress);
+            let from = newest;
+            let len = 1 + (burst * 7919) % 5000;
+            newest = std::thread::spawn(move || {
+                for lsn in from + 1..=from + len {
+                    p.update_applied(Lsn(lsn));
+                }
+                from + len
+            })
+            .join()
+            .unwrap();
+            let ended = Instant::now();
+            loop {
+                let status = tokio::time::timeout(4 * interval, r.server.status())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("burst {burst}: {newest} not sent within {:?}", 4 * interval)
+                    });
+                if status.applied == newest {
+                    break;
+                }
+                assert!(status.applied < newest);
+            }
+            assert!(ended.elapsed() <= 4 * interval);
+        }
+        r.task.abort();
     }
 }

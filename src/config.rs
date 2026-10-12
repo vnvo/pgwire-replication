@@ -382,6 +382,9 @@ pub struct ReplicationConfig {
     /// with no incoming messages, the client will send a standby status update
     /// (feedback) and continue waiting.
     ///
+    /// A raised applied LSN does not wait for this wakeup: it is sent within
+    /// `status_interval` of `update_applied_lsn`.
+    ///
     /// This effectively bounds how long the worker can stay blocked in a read
     /// while idle.
     ///
