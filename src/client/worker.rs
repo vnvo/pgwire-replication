@@ -183,6 +183,8 @@ pub struct WorkerState {
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
     metrics: Arc<ReplicationMetrics>,
+    /// Notified once the server accepted START_REPLICATION.
+    started: Option<tokio::sync::oneshot::Sender<()>>,
     /// The applied LSN in the last status update written to the server, if any.
     last_sent: Option<Lsn>,
 }
@@ -201,8 +203,14 @@ impl WorkerState {
             stop_rx,
             out,
             metrics,
+            started: None,
             last_sent: None,
         }
+    }
+
+    /// Notify `started` once the server accepts START_REPLICATION.
+    pub(crate) fn notify_started(&mut self, started: tokio::sync::oneshot::Sender<()>) {
+        self.started = Some(started);
     }
 
     /// Run the replication protocol on the given stream.
@@ -217,6 +225,9 @@ impl WorkerState {
         self.startup(&mut stream).await?;
         self.authenticate(&mut stream).await?;
         self.start_replication(&mut stream).await?;
+        if let Some(started) = self.started.take() {
+            let _ = started.send(());
+        }
         self.stream_loop(&mut stream).await
     }
 
