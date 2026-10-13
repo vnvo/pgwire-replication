@@ -45,6 +45,12 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+      - name: Loom model (progress signalling)
+        run: cargo test --release --lib loom_model
+        env:
+          RUSTFLAGS: --cfg pgwire_loom
+          CARGO_TARGET_DIR: target/loom
+
   msrv:
     name: MSRV check
     runs-on: ubuntu-latest
