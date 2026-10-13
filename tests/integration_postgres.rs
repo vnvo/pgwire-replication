@@ -643,10 +643,16 @@ async fn postgres_idle_feedback_is_change_driven() -> Result<()> {
     setup_publication_and_slot(&client, "slot_fb", "pub_fb").await?;
     let base_lsn = current_wal_lsn(&client).await?;
 
-    // status_interval 1 s, idle wakeup 15 s.
-    let mut repl = ReplicationClient::connect(replication_config(
-        host_port, "slot_fb", "pub_fb", base_lsn, None,
-    ))
+    // status_interval 1 s, idle wakeup 15 s; observe reported waits.
+    let waits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = std::sync::Arc::clone(&waits);
+    let mut repl = ReplicationClient::connect(
+        replication_config(host_port, "slot_fb", "pub_fb", base_lsn, None).with_feedback_observer(
+            pgwire_replication::FeedbackObserver::new(move |s| {
+                sink.lock().unwrap().push(s.pending_for)
+            }),
+        ),
+    )
     .await?;
     recv_keepalive(&mut repl, Duration::from_secs(10)).await?;
 
@@ -689,6 +695,12 @@ async fn postgres_idle_feedback_is_change_driven() -> Result<()> {
     info!(
         "confirmed_flush_lsn reached the acknowledged commit in {:?}",
         acked.elapsed()
+    );
+    // The observer reported the acknowledged position's wait.
+    let reported = waits.lock().unwrap().clone();
+    anyhow::ensure!(
+        reported.iter().any(|w| *w < Duration::from_secs(2)),
+        "no reported wait under 2 s: {reported:?}"
     );
 
     repl.stop();
