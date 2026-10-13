@@ -357,6 +357,16 @@ pub struct ReplicationConfig {
     /// - Specific LSN: Resume from that position (must be >= slot's restart_lsn)
     pub start_lsn: Lsn,
 
+    /// LSN reported to the server as flushed and applied until the consumer
+    /// reports more through `update_applied_lsn`.
+    ///
+    /// - `None` (default): `start_lsn`.
+    /// - `Some(lsn)`: report `lsn` instead. A consumer that resumes reading
+    ///   from a position it has not made durable sets this to its durable
+    ///   position, so the slot's `confirmed_flush_lsn` never advances past
+    ///   what the consumer could recover from after a crash.
+    pub ack_lsn: Option<Lsn>,
+
     /// Optional LSN to stop replication at.
     ///
     /// When set, replication will stop once a commit with `end_lsn >= stop_at_lsn`
@@ -373,7 +383,7 @@ pub struct ReplicationConfig {
     /// allowing the server to release WAL segments. Too infrequent updates
     /// may cause WAL accumulation; too frequent updates add overhead.
     ///
-    /// Default: 1 second (matches pg_recvlogical)
+    /// Default: 10 seconds (`pg_recvlogical` defaults to 10 seconds too)
     pub status_interval: Duration,
 
     /// Maximum time to wait for server messages before waking up.
@@ -435,6 +445,13 @@ pub struct ReplicationConfig {
     /// Default: `None` (server defaults apply).
     pub options: Option<String>,
 
+    /// `application_name` sent in the startup message, shown in
+    /// `pg_stat_activity` and `pg_stat_replication`. A consumer that must
+    /// tell its own walsender from other sessions sets a unique value.
+    ///
+    /// Default: `None` (`pgwire-replication`).
+    pub application_name: Option<String>,
+
     /// Called after each successful standby status update that advanced the
     /// position reported to the server, with how long that position waited
     /// ([`FeedbackSent`](crate::FeedbackSent)). Without one, no timing is kept.
@@ -455,12 +472,14 @@ impl Default for ReplicationConfig {
             slot: "slot".into(),
             publication: "pub".into(),
             start_lsn: Lsn(0),
+            ack_lsn: None,
             stop_at_lsn: None,
             status_interval: Duration::from_secs(10),
             idle_wakeup_interval: Duration::from_secs(10),
             buffer_events: 8192,
             binary: false,
             options: None,
+            application_name: None,
             feedback_observer: None,
         }
     }
@@ -589,6 +608,13 @@ impl ReplicationConfig {
         self
     }
 
+    /// Report `lsn` as the initially applied position instead of the start
+    /// position (see [`ReplicationConfig::ack_lsn`]).
+    pub fn with_ack_lsn(mut self, lsn: Lsn) -> Self {
+        self.ack_lsn = Some(lsn);
+        self
+    }
+
     /// Set an optional stop LSN for bounded replay.
     pub fn with_stop_lsn(mut self, lsn: Lsn) -> Self {
         self.stop_at_lsn = Some(lsn);
@@ -637,6 +663,13 @@ impl ReplicationConfig {
     /// ```
     pub fn with_options(mut self, options: impl Into<String>) -> Self {
         self.options = Some(options.into());
+        self
+    }
+
+    /// Set the startup `application_name` (see
+    /// [`ReplicationConfig::application_name`]).
+    pub fn with_application_name(mut self, name: impl Into<String>) -> Self {
+        self.application_name = Some(name.into());
         self
     }
 

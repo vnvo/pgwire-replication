@@ -10,10 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Gated sessions**: `ReplicationClient::connect_gated` connects and authenticates, then waits before `START_REPLICATION`. On that one session, `simple_query` runs SQL or replication commands (a server error leaves the session usable), and `identify_system` / `timeline_history` parse `IDENTIFY_SYSTEM` and `TIMELINE_HISTORY`. `start` then sends `START_REPLICATION`. What a consumer reads before the start describes the server the stream opens on, with no window for a failover in between. Dropping the client before `start` ends the session.
+- **Startup `application_name`**: `ReplicationConfig::application_name` / `with_application_name()` set the name shown in `pg_stat_activity` and `pg_stat_replication`, so a consumer can tell its own walsender from other sessions. Unset, it stays `pgwire-replication`.
+- **Start confirmation**: `ReplicationClient::wait_started` waits until the server has accepted `START_REPLICATION`, when the slot is held by the session, and returns the worker's error if it ended first. `connect` returns before that, since connecting, authentication and `START_REPLICATION` run in the background worker.
+- **Initial acknowledged position**: `ReplicationConfig::ack_lsn` / `with_ack_lsn()` set the LSN reported as flushed and applied until the consumer calls `update_applied_lsn`. By default it is `start_lsn`, as before. A consumer that resumes reading from a position it has not made durable sets it to its durable position, so the slot's `confirmed_flush_lsn` never passes what it could recover from after a crash.
 - **Feedback observer**: `ReplicationConfig::with_feedback_observer` takes a `FeedbackObserver` callback, called after each successful standby status update that advanced the reported position, with `FeedbackSent::pending_for`: how long that position waited, from the oldest raise it is the first to report. Coalesced raises keep the oldest start; a failed write keeps it, and `ReplicationClient::feedback_pending_since` / `carry_feedback_pending` carry it into a replacement session. No clock is read without an observer, and only for raises that advance the position. Positions are not exposed.
 
 ### Changed
 - **Change-driven standby feedback**: `update_applied_lsn` now wakes the worker, which sends the new applied LSN once `status_interval` has passed since its last standby status update, also on an idle stream. Previously an idle stream reported it only at the next `idle_wakeup_interval` wakeup, server message or keepalive reply request, so a consumer acknowledging after traffic stopped could hold WAL for that long. Updates coalesce into one status carrying the newest LSN; no wakeup is added while nothing new is pending, and `update_applied_lsn` stays a compare-and-swap plus one atomic load except for the first raise after the worker last looked. Keepalive replies, idle wakeup feedback and feedback under backpressure are unchanged.
+
+### Fixed
+- `ReplicationConfig::status_interval` documented a 1 second default; the default is 10 seconds. The README now describes change-driven feedback on an idle stream.
 
 ---
 
