@@ -49,3 +49,10 @@ impl PartialEq for FeedbackObserver {
 }
 
 impl Eq for FeedbackObserver {}
+
+// The callback is only ever called by the replication worker
+// (`observe` is crate-private), so a reference held across a
+// `catch_unwind` boundary cannot observe state that a panic left broken.
+// This keeps `ReplicationConfig` unwind safe, as it was before observers.
+impl std::panic::UnwindSafe for FeedbackObserver {}
+impl std::panic::RefUnwindSafe for FeedbackObserver {}
