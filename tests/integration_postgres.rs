@@ -774,6 +774,60 @@ async fn postgres_ack_lsn_holds_the_slot() -> Result<()> {
     Ok(())
 }
 
+/// `wait_started` returns once the server accepted START_REPLICATION, when
+/// the slot is already held by the session, and reports why the worker ended
+/// otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_wait_started_holds_the_slot() -> Result<()> {
+    init_tracing();
+
+    let host_port: u16 = std::env::var("PG_ITEST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(get_available_port);
+    let container = postgres_image(host_port)
+        .start()
+        .await
+        .expect("start postgres");
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+    setup_publication_and_slot(&client, "slot_ws", "pub_ws").await?;
+    let base_lsn = current_wal_lsn(&client).await?;
+
+    let mut repl = ReplicationClient::connect(replication_config(
+        host_port, "slot_ws", "pub_ws", base_lsn, None,
+    ))
+    .await?;
+    tokio::time::timeout(Duration::from_secs(10), repl.wait_started()).await??;
+    let active: bool = client
+        .query_one(
+            "SELECT active FROM pg_replication_slots WHERE slot_name = 'slot_ws'",
+            &[],
+        )
+        .await?
+        .get(0);
+    anyhow::ensure!(active, "slot not held after wait_started");
+    // A second call returns at once.
+    repl.wait_started().await?;
+    repl.stop();
+    let _ = repl.join().await;
+
+    let mut missing = ReplicationClient::connect(replication_config(
+        host_port,
+        "slot_missing",
+        "pub_ws",
+        base_lsn,
+        None,
+    ))
+    .await?;
+    let err = tokio::time::timeout(Duration::from_secs(10), missing.wait_started())
+        .await?
+        .expect_err("a missing slot never starts");
+    anyhow::ensure!(err.is_server(), "unexpected error: {err}");
+    Ok(())
+}
+
 /// Test error handling: connecting with a nonexistent slot should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_replication_invalid_slot_error() -> Result<()> {

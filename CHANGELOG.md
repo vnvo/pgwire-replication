@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **Start confirmation**: `ReplicationClient::wait_started` waits until the server has accepted `START_REPLICATION`, when the slot is held by the session, and returns the worker's error if it ended first. `connect` returns before that, since connecting, authentication and `START_REPLICATION` run in the background worker.
 - **Initial acknowledged position**: `ReplicationConfig::ack_lsn` / `with_ack_lsn()` set the LSN reported as flushed and applied until the consumer calls `update_applied_lsn`. By default it is `start_lsn`, as before. A consumer that resumes reading from a position it has not made durable sets it to its durable position, so the slot's `confirmed_flush_lsn` never passes what it could recover from after a crash.
 - **Feedback observer**: `ReplicationConfig::with_feedback_observer` takes a `FeedbackObserver` callback, called after each successful standby status update that advanced the reported position, with `FeedbackSent::pending_for`: how long that position waited, from the oldest raise it is the first to report. Coalesced raises keep the oldest start; a failed write keeps it, and `ReplicationClient::feedback_pending_since` / `carry_feedback_pending` carry it into a replacement session. No clock is read without an observer, and only for raises that advance the position. Positions are not exposed.
 
