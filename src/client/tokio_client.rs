@@ -93,8 +93,8 @@ pub struct ReplicationClient {
     stop_tx: watch::Sender<bool>,
     metrics: Arc<ReplicationMetrics>,
     join: Option<JoinHandle<std::result::Result<(), PgWireError>>>,
-    /// Fires once the server accepted START_REPLICATION.
-    started: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Becomes `true` once the server accepted START_REPLICATION.
+    started: watch::Receiver<bool>,
     /// Commands to a gated session before START_REPLICATION. `None`: not
     /// gated, or already started.
     gate: Option<mpsc::Sender<GateCommand>>,
@@ -145,7 +145,7 @@ impl ReplicationClient {
         ));
 
         let (stop_tx, stop_rx) = watch::channel(false);
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (started_tx, started_rx) = watch::channel(false);
 
         let metrics = Arc::new(ReplicationMetrics::default());
 
@@ -178,7 +178,7 @@ impl ReplicationClient {
             stop_tx,
             metrics,
             join: Some(join),
-            started: Some(started_rx),
+            started: started_rx,
             gate: None,
         })
     }
@@ -272,13 +272,9 @@ impl ReplicationClient {
     /// replication slot is held by this session, and no other session can
     /// acquire or advance it. [`connect`](Self::connect) returns before that,
     /// as connecting, authentication and START_REPLICATION run in the
-    /// background worker. Returns the worker's error if it ended first, and
-    /// `Ok` at once after the first call.
+    /// background worker. Returns the worker's error if it ended first.
     pub async fn wait_started(&mut self) -> Result<()> {
-        let Some(started) = self.started.take() else {
-            return Ok(());
-        };
-        if started.await.is_ok() {
+        if self.started.wait_for(|started| *started).await.is_ok() {
             return Ok(());
         }
         match self.handle_worker_shutdown().await {

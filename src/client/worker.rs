@@ -200,8 +200,8 @@ pub struct WorkerState {
     stop_rx: watch::Receiver<bool>,
     out: mpsc::Sender<std::result::Result<ReplicationEvent, PgWireError>>,
     metrics: Arc<ReplicationMetrics>,
-    /// Notified once the server accepted START_REPLICATION.
-    started: Option<tokio::sync::oneshot::Sender<()>>,
+    /// Set to `true` once the server accepted START_REPLICATION.
+    started: Option<watch::Sender<bool>>,
     /// When set, the session waits for these commands between authentication
     /// and START_REPLICATION.
     gate: Option<mpsc::Receiver<GateCommand>>,
@@ -230,7 +230,7 @@ impl WorkerState {
     }
 
     /// Notify `started` once the server accepts START_REPLICATION.
-    pub(crate) fn notify_started(&mut self, started: tokio::sync::oneshot::Sender<()>) {
+    pub(crate) fn notify_started(&mut self, started: watch::Sender<bool>) {
         self.started = Some(started);
     }
 
@@ -287,8 +287,8 @@ impl WorkerState {
             }
         }
         self.start_replication(&mut stream).await?;
-        if let Some(started) = self.started.take() {
-            let _ = started.send(());
+        if let Some(started) = &self.started {
+            started.send_replace(true);
         }
         self.stream_loop(&mut stream).await
     }
