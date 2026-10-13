@@ -473,6 +473,13 @@ pub struct ReplicationConfig {
     /// Default: [`MAX_MESSAGE_SIZE`](crate::protocol::framing::MAX_MESSAGE_SIZE) (1 GiB)
     pub max_message_size: usize,
 
+    /// `application_name` sent in the startup message, shown in
+    /// `pg_stat_activity` and `pg_stat_replication`. A consumer that must
+    /// tell its own walsender from other sessions sets a unique value.
+    ///
+    /// Default: `None` (`pgwire-replication`).
+    pub application_name: Option<String>,
+
     /// Called after each successful standby status update that advanced the
     /// position reported to the server, with how long that position waited
     /// ([`FeedbackSent`](crate::FeedbackSent)). Without one, no timing is kept.
@@ -501,6 +508,7 @@ impl Default for ReplicationConfig {
             binary: false,
             options: None,
             max_message_size: crate::protocol::framing::MAX_MESSAGE_SIZE,
+            application_name: None,
             feedback_observer: None,
         }
     }
@@ -704,6 +712,13 @@ impl ReplicationConfig {
     /// ```
     pub fn with_max_message_size(mut self, bytes: usize) -> Self {
         self.max_message_size = bytes.min(crate::protocol::framing::MAX_MESSAGE_SIZE);
+        self
+    }
+
+    /// Set the startup `application_name` (see
+    /// [`ReplicationConfig::application_name`]).
+    pub fn with_application_name(mut self, name: impl Into<String>) -> Self {
+        self.application_name = Some(name.into());
         self
     }
 
