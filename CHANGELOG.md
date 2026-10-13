@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Feedback observer**: `ReplicationConfig::with_feedback_observer` takes a `FeedbackObserver` callback, called after each successful standby status update that advanced the reported position, with `FeedbackSent::pending_for`: how long that position waited, from the oldest raise it is the first to report. Coalesced raises keep the oldest start; a failed write keeps it, and `ReplicationClient::feedback_pending_since` / `carry_feedback_pending` carry it into a replacement session. No clock is read without an observer, and only for raises that advance the position. Positions are not exposed.
+
 ### Changed
 - **Change-driven standby feedback**: `update_applied_lsn` now wakes the worker, which sends the new applied LSN once `status_interval` has passed since its last standby status update, also on an idle stream. Previously an idle stream reported it only at the next `idle_wakeup_interval` wakeup, server message or keepalive reply request, so a consumer acknowledging after traffic stopped could hold WAL for that long. Updates coalesce into one status carrying the newest LSN; no wakeup is added while nothing new is pending, and `update_applied_lsn` stays a compare-and-swap plus one atomic load except for the first raise after the worker last looked. Keepalive replies, idle wakeup feedback and feedback under backpressure are unchanged.
 
