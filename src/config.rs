@@ -462,6 +462,13 @@ pub struct ReplicationConfig {
     ///
     /// Default: [`MAX_MESSAGE_SIZE`](crate::protocol::framing::MAX_MESSAGE_SIZE) (1 GiB)
     pub max_message_size: usize,
+
+    /// Called after each successful standby status update that advanced the
+    /// position reported to the server, with how long that position waited
+    /// ([`FeedbackSent`](crate::FeedbackSent)). Without one, no timing is kept.
+    ///
+    /// Default: `None`
+    pub feedback_observer: Option<crate::FeedbackObserver>,
 }
 
 impl Default for ReplicationConfig {
@@ -483,6 +490,7 @@ impl Default for ReplicationConfig {
             binary: false,
             options: None,
             max_message_size: crate::protocol::framing::MAX_MESSAGE_SIZE,
+            feedback_observer: None,
         }
     }
 }
@@ -678,6 +686,13 @@ impl ReplicationConfig {
     /// ```
     pub fn with_max_message_size(mut self, bytes: usize) -> Self {
         self.max_message_size = bytes.min(crate::protocol::framing::MAX_MESSAGE_SIZE);
+        self
+    }
+
+    /// Observe successful standby status updates that advanced the reported
+    /// position (see [`feedback_observer`](Self::feedback_observer)).
+    pub fn with_feedback_observer(mut self, observer: crate::FeedbackObserver) -> Self {
+        self.feedback_observer = Some(observer);
         self
     }
 

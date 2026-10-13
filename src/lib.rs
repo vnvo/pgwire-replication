@@ -82,7 +82,8 @@ pub mod protocol;
 pub mod tls;
 
 pub use client::{
-    ReplicationClient, ReplicationEvent, ReplicationEventReceiver, ReplicationMetrics,
+    FeedbackObserver, FeedbackSent, ReplicationClient, ReplicationEvent, ReplicationEventReceiver,
+    ReplicationMetrics,
 };
 pub use config::{Publication, ReplicationConfig, SslMode, TlsConfig};
 pub use error::{PgWireError, Result};

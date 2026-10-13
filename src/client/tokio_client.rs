@@ -92,7 +92,10 @@ impl ReplicationClient {
         let (tx, rx) = mpsc::channel(cfg.buffer_events);
 
         // Progress is shared via atomics: cheap, monotonic, no async backpressure.
-        let progress = Arc::new(SharedProgress::new(cfg.start_lsn));
+        let progress = Arc::new(SharedProgress::with_timing(
+            cfg.start_lsn,
+            cfg.feedback_observer.is_some(),
+        ));
 
         let (stop_tx, stop_rx) = watch::channel(false);
 
@@ -163,6 +166,24 @@ impl ReplicationClient {
     #[inline]
     pub fn update_applied_lsn(&self, lsn: Lsn) {
         self.progress.update_applied(lsn);
+    }
+
+    /// When the oldest applied-position raise not yet reported to the server
+    /// happened, with a feedback observer configured; `None` otherwise or
+    /// when everything raised was reported. Readable after the session ended,
+    /// so a caller replacing a failed session can carry it over with
+    /// [`carry_feedback_pending`](Self::carry_feedback_pending).
+    pub fn feedback_pending_since(&self) -> Option<std::time::Instant> {
+        self.progress.pending_since()
+    }
+
+    /// Carry over a pending start from a session this one replaces (from its
+    /// [`feedback_pending_since`](Self::feedback_pending_since)): the next
+    /// update that advances the reported position reports its wait from
+    /// there, or from an older start of this session. No effect without a
+    /// feedback observer.
+    pub fn carry_feedback_pending(&self, since: std::time::Instant) {
+        self.progress.carry_pending(since);
     }
 
     /// Returns a handle to the live replication metrics.

@@ -30,12 +30,55 @@ pub struct SharedProgress {
     changed: watch::Sender<u64>,
 }
 
+/// Clock origin for pending starts (nanoseconds after it, plus one), shared
+/// by every session so a start carried from an earlier one stays comparable.
+/// tokio's clock: the system clock, paused under test. Set an hour back so a
+/// clock read on another (paused) runtime never falls before it.
+fn clock_origin() -> Instant {
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *ORIGIN.get_or_init(|| {
+        let now = Instant::now();
+        now.checked_sub(std::time::Duration::from_secs(3600))
+            .unwrap_or(now)
+    })
+}
+
 impl SharedProgress {
+    #[cfg(test)]
     pub fn new(start: Lsn) -> Self {
+        Self::with_timing(start, false)
+    }
+
+    /// `timed`: keep when the oldest unreported raise happened, for a
+    /// feedback observer.
+    pub fn with_timing(start: Lsn, timed: bool) -> Self {
         Self {
-            cell: ProgressCell::new(start.as_u64()),
+            cell: ProgressCell::new(start.as_u64(), timed),
             changed: watch::Sender::new(0),
         }
+    }
+
+    fn clock(&self) -> u64 {
+        clock_origin().elapsed().as_nanos() as u64 + 1
+    }
+
+    fn instant(&self, clock: u64) -> Instant {
+        clock_origin() + std::time::Duration::from_nanos(clock - 1)
+    }
+
+    /// When the oldest raise not yet reported to the server happened.
+    pub fn pending_since(&self) -> Option<std::time::Instant> {
+        match self.cell.pending_since() {
+            0 => None,
+            clock => Some(self.instant(clock).into_std()),
+        }
+    }
+
+    /// Carry over the pending start of an earlier session (the older wins).
+    pub fn carry_pending(&self, since: std::time::Instant) {
+        let since = Instant::from_std(since);
+        let clock = since.saturating_duration_since(clock_origin()).as_nanos() as u64 + 1;
+        self.cell.carry_pending(clock);
     }
 
     #[inline]
@@ -47,7 +90,7 @@ impl SharedProgress {
     /// this is a no-op.
     #[inline]
     pub fn update_applied(&self, lsn: Lsn) {
-        if self.cell.raise(lsn.as_u64()) {
+        if self.cell.raise(lsn.as_u64(), || self.clock()) {
             self.changed.send_modify(|g| *g = g.wrapping_add(1));
         }
     }
@@ -722,11 +765,24 @@ impl WorkerState {
         applied: Lsn,
         reply_requested: bool,
     ) -> Result<()> {
+        // Timed only when this write advances the reported position and
+        // someone observes it.
+        let loaded_at = (self.cfg.feedback_observer.is_some()
+            && self.last_sent.is_none_or(|sent| applied > sent))
+        .then(|| self.progress.clock());
         let client_time = current_pg_timestamp();
         let payload = encode_standby_status_update(applied, client_time, reply_requested);
         write_copy_data(stream, &payload).await?;
         self.last_sent = Some(applied);
         self.metrics.record_feedback_sent(applied);
+        if let (Some(at), Some(observer)) = (loaded_at, &self.cfg.feedback_observer) {
+            let since = self.progress.cell.take_pending(applied.as_u64(), at);
+            if since != 0 {
+                observer.observe(crate::FeedbackSent {
+                    pending_for: self.progress.instant(since).elapsed(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -1324,6 +1380,8 @@ mod tests {
     }
 
     struct Running {
+        /// When the worker was started (tokio's clock).
+        started: Instant,
         server: Server,
         task: tokio::task::JoinHandle<Result<()>>,
         stop: watch::Sender<bool>,
@@ -1364,6 +1422,7 @@ mod tests {
             worker.stream_loop(&mut buf).await
         });
         Running {
+            started: Instant::now(),
             server: Server {
                 end,
                 reader: MessageReader::new(),
@@ -1572,6 +1631,157 @@ mod tests {
             }
             assert!(ended.elapsed() <= 4 * interval);
         }
+        r.task.abort();
+    }
+
+    // ── Feedback observer ─────────────────────────────────────────────────
+
+    type Seen = Arc<std::sync::Mutex<Vec<std::time::Duration>>>;
+
+    fn observed_cfg() -> (ReplicationConfig, Seen) {
+        let seen: Seen = Arc::default();
+        let sink = Arc::clone(&seen);
+        let cfg = feedback_cfg().with_feedback_observer(crate::FeedbackObserver::new(move |s| {
+            sink.lock().unwrap().push(s.pending_for)
+        }));
+        (cfg, seen)
+    }
+
+    fn seen(s: &Seen) -> Vec<std::time::Duration> {
+        s.lock().unwrap().clone()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_observer_reports_how_long_a_position_waited() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), true));
+        let mut r = run_stream_with(cfg, &progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        assert!(
+            seen(&s).is_empty(),
+            "nothing was pending at the first status"
+        );
+        assert!(r.server.quiet(3 * SECOND).await);
+
+        // Due at once: no wait.
+        progress.update_applied(Lsn(100));
+        assert_eq!(r.server.status().await.applied, 100);
+        // Waits for the interval.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        progress.update_applied(Lsn(200));
+        assert_eq!(r.server.status().await.applied, 200);
+        assert_eq!(
+            seen(&s),
+            vec![
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(900)
+            ]
+        );
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coalesced_raises_report_the_oldest_wait() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), true));
+        let mut r = run_stream_with(cfg, &progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        for (at_ms, lsn) in [(100, 1), (500, 2), (900, 3)] {
+            tokio::time::sleep_until(r.started + std::time::Duration::from_millis(at_ms)).await;
+            progress.update_applied(Lsn(lsn));
+        }
+        assert_eq!(r.server.status().await.applied, 3);
+        assert_eq!(seen(&s), vec![std::time::Duration::from_millis(900)]);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_observation_when_the_position_does_not_advance() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(40), true));
+        let mut r = run_stream_with(cfg, &progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 40);
+        r.server.send(&keepalive_frame(90, true)).await;
+        assert!(r.server.status().await.reply);
+        progress.update_applied(Lsn(40)); // not a raise
+        for _ in 0..3 {
+            r.server.status().await; // idle wakeups
+        }
+        assert!(seen(&s).is_empty());
+        assert_eq!(progress.pending_since(), None);
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_write_carries_its_wait_into_the_next_session() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), true));
+        let mut r = run_stream_with(cfg.clone(), &progress, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 0);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        progress.update_applied(Lsn(700));
+        drop(r.server);
+        assert!(r.task.await.unwrap().is_err(), "the write fails");
+        let since = progress.pending_since().expect("still pending");
+
+        // The replacement session starts from the acknowledged position and
+        // carries the pending start over.
+        tokio::time::sleep(2 * SECOND).await;
+        let next = Arc::new(SharedProgress::with_timing(Lsn(700), true));
+        next.carry_pending(since);
+        let mut r = run_stream_with(cfg, &next, 64 * 1024);
+        assert_eq!(r.server.status().await.applied, 700);
+        let waited = seen(&s);
+        assert_eq!(waited.len(), 1);
+        assert!(waited[0] >= 2 * SECOND, "{waited:?}");
+        r.task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_timed_without_an_observer() {
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), false));
+        progress.update_applied(Lsn(5));
+        assert_eq!(progress.pending_since(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_raise_during_a_write_keeps_a_pending_start() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(0), true));
+        progress.update_applied(Lsn(1));
+        // Too small for one status message: the first write blocks.
+        let mut r = run_stream_with(cfg, &progress, 8);
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        progress.update_applied(Lsn(2));
+        assert_eq!(r.server.status().await.applied, 1);
+        assert_eq!(r.server.status().await.applied, 2);
+        assert_eq!(seen(&s).len(), 2, "both waits are reported");
+        r.task.abort();
+    }
+
+    /// A write that repeats the reported position (an idle wakeup) completing
+    /// while a newer raise is pending does not report that raise; the write
+    /// that carries it does, once.
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_position_does_not_report_a_pending_raise() {
+        let (cfg, s) = observed_cfg();
+        let progress = Arc::new(SharedProgress::with_timing(Lsn(40), true));
+        // Too small for one status message: writes block until read.
+        let mut r = run_stream_with(cfg, &progress, 8);
+        assert_eq!(r.server.status().await.applied, 40);
+        // The idle wakeup (10 s) writes 40 again and blocks unread; raise
+        // while it is in flight.
+        tokio::time::sleep_until(r.started + std::time::Duration::from_millis(10_500)).await;
+        progress.update_applied(Lsn(50));
+        assert_eq!(r.server.status().await.applied, 40);
+        assert!(
+            seen(&s).is_empty(),
+            "the repeated position reported nothing"
+        );
+        assert_eq!(r.server.status().await.applied, 50);
+        assert_eq!(seen(&s).len(), 1);
         r.task.abort();
     }
 }
