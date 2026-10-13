@@ -238,7 +238,13 @@ impl WorkerState {
             ("database", self.cfg.database.as_str()),
             ("replication", "database"),
             ("client_encoding", "UTF8"),
-            ("application_name", "pgwire-replication"),
+            (
+                "application_name",
+                self.cfg
+                    .application_name
+                    .as_deref()
+                    .unwrap_or("pgwire-replication"),
+            ),
         ];
         // PostgreSQL honors `options` on replication connections the same as on
         // ordinary ones, so this lets callers pin session GUCs (e.g. `DateStyle`,
@@ -1070,6 +1076,31 @@ mod tests {
             sent.contains("-c datestyle=ISO,MDY -c intervalstyle=iso_8601"),
             "startup message missing options value: {sent:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn startup_sends_the_application_name() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (cfg, expected) in [
+            (ReplicationConfig::default(), "pgwire-replication"),
+            (
+                ReplicationConfig::default().with_application_name("df-7f3a"),
+                "df-7f3a",
+            ),
+        ] {
+            let (worker, _stop_tx, _rx) = test_worker(cfg);
+            let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+            worker.startup(&mut worker_end).await.unwrap();
+            worker_end.shutdown().await.unwrap();
+            let mut sent = Vec::new();
+            server.read_to_end(&mut sent).await.unwrap();
+            let pair = format!("application_name\0{expected}\0");
+            assert!(
+                sent.windows(pair.len()).any(|w| w == pair.as_bytes()),
+                "startup message missing {pair:?}"
+            );
+        }
     }
 
     #[tokio::test]
