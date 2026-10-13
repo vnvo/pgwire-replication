@@ -1,11 +1,11 @@
 use bytes::Bytes;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, BufReader};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
 use super::metrics::ReplicationMetrics;
+use super::progress::ProgressCell;
 use crate::config::ReplicationConfig;
 use crate::error::{PgWireError, Result};
 use crate::lsn::Lsn;
@@ -20,56 +20,35 @@ use crate::protocol::replication::{
 
 /// Shared replication progress updated by the consumer and read by the worker.
 ///
-/// The applied LSN is an AtomicU64 so progress updates are cheap and monotonic
-/// without async backpressure. A raise also wakes an idle worker, which sends
-/// it promptly instead of at its next wakeup. Only the first raise after the
-/// worker last looked bumps the watch generation; later ones coalesce into it
-/// and cost one more atomic load.
+/// The applied LSN lives in a lock-free [`ProgressCell`] so progress updates
+/// are cheap and monotonic without async backpressure. A raise also wakes an
+/// idle worker, which sends it promptly instead of at its next wakeup. Only the
+/// first raise after the worker last looked bumps the watch generation; later
+/// ones coalesce into it and cost one more atomic load.
 pub struct SharedProgress {
-    applied: AtomicU64,
-    /// Set by the first raise the worker has not looked at yet.
-    signalled: AtomicBool,
+    cell: ProgressCell,
     changed: watch::Sender<u64>,
 }
 
 impl SharedProgress {
     pub fn new(start: Lsn) -> Self {
         Self {
-            applied: AtomicU64::new(start.as_u64()),
-            signalled: AtomicBool::new(false),
+            cell: ProgressCell::new(start.as_u64()),
             changed: watch::Sender::new(0),
         }
     }
 
     #[inline]
     pub fn load_applied(&self) -> Lsn {
-        Lsn::from_u64(self.applied.load(Ordering::Acquire))
+        Lsn::from_u64(self.cell.load())
     }
 
     /// Monotonic update: if `lsn` is lower than the currently stored applied LSN,
     /// this is a no-op.
     #[inline]
     pub fn update_applied(&self, lsn: Lsn) {
-        let new = lsn.as_u64();
-        let mut cur = self.applied.load(Ordering::Relaxed);
-
-        while new > cur {
-            // SeqCst pairs with `take_signal`: either the worker reads this
-            // raise, or this raise sees the signal cleared and wakes it.
-            match self
-                .applied
-                .compare_exchange_weak(cur, new, Ordering::SeqCst, Ordering::Relaxed)
-            {
-                Ok(_) => {
-                    if !self.signalled.load(Ordering::Relaxed)
-                        && !self.signalled.swap(true, Ordering::SeqCst)
-                    {
-                        self.changed.send_modify(|g| *g = g.wrapping_add(1));
-                    }
-                    break;
-                }
-                Err(observed) => cur = observed,
-            }
+        if self.cell.raise(lsn.as_u64()) {
+            self.changed.send_modify(|g| *g = g.wrapping_add(1));
         }
     }
 
@@ -81,8 +60,7 @@ impl SharedProgress {
     /// The worker is about to read the applied LSN: the next raise wakes it
     /// again. Returns the applied LSN read after clearing the signal.
     fn take_signal(&self) -> Lsn {
-        self.signalled.store(false, Ordering::SeqCst);
-        Lsn::from_u64(self.applied.load(Ordering::SeqCst))
+        Lsn::from_u64(self.cell.take_signal())
     }
 }
 

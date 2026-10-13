@@ -71,6 +71,7 @@
 //! ```
 
 mod metrics;
+mod progress;
 mod tokio_client;
 mod worker;
 
