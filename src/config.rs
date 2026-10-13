@@ -383,7 +383,7 @@ pub struct ReplicationConfig {
     /// allowing the server to release WAL segments. Too infrequent updates
     /// may cause WAL accumulation; too frequent updates add overhead.
     ///
-    /// Default: 1 second (matches pg_recvlogical)
+    /// Default: 10 seconds (`pg_recvlogical` defaults to 10 seconds too)
     pub status_interval: Duration,
 
     /// Maximum time to wait for server messages before waking up.

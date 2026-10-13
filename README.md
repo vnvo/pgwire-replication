@@ -165,7 +165,8 @@ This allows callers to control:
 
 Updates are **monotonic**: reporting an older LSN is a no-op.
 Standby status updates are sent asynchronously by the worker using the
-latest applied LSN, based on `status_interval` or server keepalive requests.
+latest applied LSN: a raised LSN within `status_interval` of the last update,
+also on an idle stream, and at once when the server requests a reply.
 For CDC pipelines, progress should typically be reported at **transaction commit boundaries**, not for every message.
 
 ## Backpressure
@@ -237,8 +238,9 @@ This is normal.
 
 `idle_wakeup_interval` does not indicate failure. It bounds how long the client may block
 waiting for server messages before waking up to send a standby status update and continue waiting.
-While the system is idle, the effective feedback cadence is bounded by
-`idle_wakeup_interval`, not `status_interval`.
+While the system is idle and nothing new is acknowledged, the feedback cadence
+is bounded by `idle_wakeup_interval`; a newly applied LSN is still sent within
+`status_interval`.
 
 ## Logical Decoding Messages
 
