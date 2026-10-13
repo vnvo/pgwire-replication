@@ -93,7 +93,7 @@ impl ReplicationClient {
 
         // Progress is shared via atomics: cheap, monotonic, no async backpressure.
         let progress = Arc::new(SharedProgress::with_timing(
-            cfg.start_lsn,
+            cfg.ack_lsn.unwrap_or(cfg.start_lsn),
             cfg.feedback_observer.is_some(),
         ));
 

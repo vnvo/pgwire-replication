@@ -708,6 +708,72 @@ async fn postgres_idle_feedback_is_change_driven() -> Result<()> {
     Ok(())
 }
 
+/// Wait until the client has sent at least `n` standby status updates.
+async fn wait_feedback_sent(repl: &ReplicationClient, n: u64, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while repl.metrics().feedback_sent() < n {
+        anyhow::ensure!(Instant::now() < deadline, "no status update sent");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
+/// With `ack_lsn`, a stream that starts ahead of the slot reports the
+/// consumer's durable position, not the start position: the slot does not
+/// advance past it. Without it, the start position is reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_ack_lsn_holds_the_slot() -> Result<()> {
+    init_tracing();
+
+    let host_port: u16 = std::env::var("PG_ITEST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(get_available_port);
+    let container = postgres_image(host_port)
+        .start()
+        .await
+        .expect("start postgres");
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+    setup_publication_and_slot(&client, "slot_ack", "pub_ack").await?;
+    let durable = confirmed_flush(&client, "slot_ack").await?;
+    client
+        .execute("INSERT INTO t(id, v) VALUES (1, 'a')", &[])
+        .await?;
+    let ahead = current_wal_lsn(&client).await?;
+    anyhow::ensure!(ahead > durable, "WAL did not advance");
+
+    let repl = ReplicationClient::connect(
+        replication_config(host_port, "slot_ack", "pub_ack", ahead, None).with_ack_lsn(durable),
+    )
+    .await?;
+    wait_feedback_sent(&repl, 1, Duration::from_secs(10)).await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let held = confirmed_flush(&client, "slot_ack").await?;
+    anyhow::ensure!(
+        held == durable,
+        "slot moved from {durable} to {held} with ack_lsn set"
+    );
+    repl.stop();
+    let _ = repl.join().await;
+
+    // Control: without ack_lsn the start position is reported.
+    let repl = ReplicationClient::connect(replication_config(
+        host_port, "slot_ack", "pub_ack", ahead, None,
+    ))
+    .await?;
+    wait_feedback_sent(&repl, 1, Duration::from_secs(10)).await?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while confirmed_flush(&client, "slot_ack").await? < ahead {
+        anyhow::ensure!(Instant::now() < deadline, "slot did not reach {ahead}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    repl.stop();
+    let _ = repl.join().await;
+    Ok(())
+}
+
 /// Test error handling: connecting with a nonexistent slot should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_replication_invalid_slot_error() -> Result<()> {
