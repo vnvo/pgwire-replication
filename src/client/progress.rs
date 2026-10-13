@@ -106,11 +106,42 @@ impl ProgressCell {
         if !self.timed || since == 0 {
             return;
         }
-        let _ = self
-            .pending_since
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                (cur == 0 || since < cur).then_some(since)
-            });
+        // A compare-exchange loop: `fetch_update` is deprecated on newer
+        // toolchains and its replacement is not available at the MSRV.
+        let mut cur = self.pending_since.load(Ordering::SeqCst);
+        while cur == 0 || since < cur {
+            match self.pending_since.compare_exchange_weak(
+                cur,
+                since,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(pgwire_loom)))]
+mod tests {
+    use super::ProgressCell;
+
+    #[test]
+    fn a_carried_pending_start_keeps_the_oldest() {
+        let cell = ProgressCell::new(0, true);
+        cell.carry_pending(0);
+        assert_eq!(cell.pending_since(), 0, "0 means nothing pending");
+        cell.carry_pending(50);
+        assert_eq!(cell.pending_since(), 50);
+        cell.carry_pending(70);
+        assert_eq!(cell.pending_since(), 50, "a newer start is ignored");
+        cell.carry_pending(20);
+        assert_eq!(cell.pending_since(), 20, "an older start wins");
+
+        let untimed = ProgressCell::new(0, false);
+        untimed.carry_pending(20);
+        assert_eq!(untimed.pending_since(), 0, "untimed keeps nothing");
     }
 }
 
