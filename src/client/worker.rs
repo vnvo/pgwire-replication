@@ -1022,7 +1022,7 @@ mod tests {
         watch::Sender<bool>,
         mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>,
     ) {
-        let progress = Arc::new(SharedProgress::new(cfg.start_lsn));
+        let progress = Arc::new(SharedProgress::new(cfg.ack_lsn.unwrap_or(cfg.start_lsn)));
         let (stop_tx, stop_rx) = watch::channel(false);
         let (tx, rx) = mpsc::channel(16);
         let metrics = Arc::new(ReplicationMetrics::default());

@@ -357,6 +357,16 @@ pub struct ReplicationConfig {
     /// - Specific LSN: Resume from that position (must be >= slot's restart_lsn)
     pub start_lsn: Lsn,
 
+    /// LSN reported to the server as flushed and applied until the consumer
+    /// reports more through `update_applied_lsn`.
+    ///
+    /// - `None` (default): `start_lsn`.
+    /// - `Some(lsn)`: report `lsn` instead. A consumer that resumes reading
+    ///   from a position it has not made durable sets this to its durable
+    ///   position, so the slot's `confirmed_flush_lsn` never advances past
+    ///   what the consumer could recover from after a crash.
+    pub ack_lsn: Option<Lsn>,
+
     /// Optional LSN to stop replication at.
     ///
     /// When set, replication will stop once a commit with `end_lsn >= stop_at_lsn`
@@ -455,6 +465,7 @@ impl Default for ReplicationConfig {
             slot: "slot".into(),
             publication: "pub".into(),
             start_lsn: Lsn(0),
+            ack_lsn: None,
             stop_at_lsn: None,
             status_interval: Duration::from_secs(10),
             idle_wakeup_interval: Duration::from_secs(10),
@@ -586,6 +597,13 @@ impl ReplicationConfig {
     /// Set the starting LSN.
     pub fn with_start_lsn(mut self, lsn: Lsn) -> Self {
         self.start_lsn = lsn;
+        self
+    }
+
+    /// Report `lsn` as the initially applied position instead of the start
+    /// position (see [`ReplicationConfig::ack_lsn`]).
+    pub fn with_ack_lsn(mut self, lsn: Lsn) -> Self {
+        self.ack_lsn = Some(lsn);
         self
     }
 
