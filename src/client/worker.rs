@@ -176,6 +176,23 @@ pub enum ReplicationEvent {
 pub type ReplicationEventReceiver =
     mpsc::Receiver<std::result::Result<ReplicationEvent, PgWireError>>;
 
+/// One row of a simple-query result: each column's text-format value, `None`
+/// for SQL NULL.
+pub type QueryRow = Vec<Option<Bytes>>;
+
+/// A request to a gated session, which waits after authentication instead of
+/// starting replication at once.
+pub(crate) enum GateCommand {
+    /// Run a simple query (SQL or a replication command such as
+    /// IDENTIFY_SYSTEM) on the authenticated session.
+    Query {
+        sql: String,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<QueryRow>>>,
+    },
+    /// Send START_REPLICATION.
+    Start,
+}
+
 /// Internal worker state.
 pub struct WorkerState {
     cfg: ReplicationConfig,
@@ -185,6 +202,9 @@ pub struct WorkerState {
     metrics: Arc<ReplicationMetrics>,
     /// Notified once the server accepted START_REPLICATION.
     started: Option<tokio::sync::oneshot::Sender<()>>,
+    /// When set, the session waits for these commands between authentication
+    /// and START_REPLICATION.
+    gate: Option<mpsc::Receiver<GateCommand>>,
     /// The applied LSN in the last status update written to the server, if any.
     last_sent: Option<Lsn>,
 }
@@ -204,6 +224,7 @@ impl WorkerState {
             out,
             metrics,
             started: None,
+            gate: None,
             last_sent: None,
         }
     }
@@ -211,6 +232,42 @@ impl WorkerState {
     /// Notify `started` once the server accepts START_REPLICATION.
     pub(crate) fn notify_started(&mut self, started: tokio::sync::oneshot::Sender<()>) {
         self.started = Some(started);
+    }
+
+    /// Wait for `gate` commands after authentication, before START_REPLICATION:
+    /// queries run on the authenticated session, `Start` starts replication,
+    /// and a closed gate ends the session without starting.
+    pub(crate) fn gate_before_start(&mut self, gate: mpsc::Receiver<GateCommand>) {
+        self.gate = Some(gate);
+    }
+
+    /// Serve gate commands until `Start`. `false`: the gate closed (the client
+    /// was dropped) and the session ended without starting.
+    async fn serve_gate<S: AsyncRead + AsyncWrite + Unpin>(
+        gate: &mut mpsc::Receiver<GateCommand>,
+        stream: &mut S,
+    ) -> Result<bool> {
+        loop {
+            match gate.recv().await {
+                Some(GateCommand::Query { sql, reply }) => {
+                    let result = simple_query(stream, &sql).await;
+                    // A server error leaves the session usable (it ends with
+                    // ReadyForQuery); anything else leaves the stream in an
+                    // unknown state, so the session ends.
+                    let broken = matches!(&result, Err(e) if !e.is_server());
+                    let ended = result.as_ref().err().cloned();
+                    let _ = reply.send(result);
+                    if broken {
+                        return Err(ended.expect("checked error"));
+                    }
+                }
+                Some(GateCommand::Start) => return Ok(true),
+                None => {
+                    write_terminate(stream).await?;
+                    return Ok(false);
+                }
+            }
+        }
     }
 
     /// Run the replication protocol on the given stream.
@@ -224,6 +281,11 @@ impl WorkerState {
         let mut stream = BufReader::with_capacity(128 * 1024, stream);
         self.startup(&mut stream).await?;
         self.authenticate(&mut stream).await?;
+        if let Some(mut gate) = self.gate.take() {
+            if !Self::serve_gate(&mut gate, &mut stream).await? {
+                return Ok(());
+            }
+        }
         self.start_replication(&mut stream).await?;
         if let Some(started) = self.started.take() {
             let _ = started.send(());
@@ -804,6 +866,67 @@ impl WorkerState {
     }
 }
 
+/// Run `sql` with the simple query protocol and collect its rows (text
+/// format). A server ErrorResponse is returned once the server is ready for
+/// the next query.
+async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    sql: &str,
+) -> Result<Vec<QueryRow>> {
+    write_query(stream, sql).await?;
+    let mut rows = Vec::new();
+    let mut error = None;
+    loop {
+        let msg = read_backend_message(stream).await?;
+        match msg.tag {
+            b'D' => rows.push(parse_data_row(&msg.payload)?),
+            b'E' => error = Some(PgWireError::Server(parse_error_response(&msg.payload))),
+            b'Z' => return error.map_or(Ok(rows), Err),
+            // RowDescription, CommandComplete, EmptyQueryResponse, notices,
+            // parameter status.
+            _ => continue,
+        }
+    }
+}
+
+/// Parse a DataRow ('D') payload.
+fn parse_data_row(payload: &Bytes) -> Result<QueryRow> {
+    let malformed = || PgWireError::Protocol("malformed DataRow".into());
+    let mut p = payload.clone();
+    if p.len() < 2 {
+        return Err(malformed());
+    }
+    let columns = i16::from_be_bytes([p[0], p[1]]);
+    p = p.slice(2..);
+    let mut row = Vec::with_capacity(columns.max(0) as usize);
+    for _ in 0..columns {
+        if p.len() < 4 {
+            return Err(malformed());
+        }
+        let len = i32::from_be_bytes([p[0], p[1], p[2], p[3]]);
+        p = p.slice(4..);
+        if len < 0 {
+            row.push(None);
+            continue;
+        }
+        let len = len as usize;
+        if p.len() < len {
+            return Err(malformed());
+        }
+        row.push(Some(p.slice(..len)));
+        p = p.slice(len..);
+    }
+    Ok(row)
+}
+
+/// Send Terminate ('X') to end the session.
+async fn write_terminate<S: AsyncWrite + Unpin>(stream: &mut S) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    stream.write_all(&[b'X', 0, 0, 0, 4]).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
 /// Parse SASL mechanism list from auth data.
 fn parse_sasl_mechanisms(data: &[u8]) -> Vec<String> {
     let mut mechanisms = Vec::new();
@@ -1181,6 +1304,153 @@ mod tests {
         );
         // And nothing was acknowledged.
         assert_eq!(metrics.last_applied_lsn(), Lsn(0));
+    }
+
+    /// A backend frame: tag, length, payload.
+    fn frame(tag: u8, payload: &[u8]) -> Vec<u8> {
+        let mut f = vec![tag];
+        f.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+        f.extend_from_slice(payload);
+        f
+    }
+
+    fn data_row(cols: &[Option<&[u8]>]) -> Vec<u8> {
+        let mut p = (cols.len() as i16).to_be_bytes().to_vec();
+        for c in cols {
+            match c {
+                Some(v) => {
+                    p.extend_from_slice(&(v.len() as i32).to_be_bytes());
+                    p.extend_from_slice(v);
+                }
+                None => p.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        frame(b'D', &p)
+    }
+
+    /// Read one frontend message (tag + payload) from the server side.
+    async fn read_frontend(server: &mut tokio::io::DuplexStream) -> (u8, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        let tag = server.read_u8().await.unwrap();
+        let len = server.read_i32().await.unwrap() as usize;
+        let mut payload = vec![0; len - 4];
+        server.read_exact(&mut payload).await.unwrap();
+        (tag, payload)
+    }
+
+    async fn gated_query(
+        gate: &mpsc::Sender<GateCommand>,
+        sql: &str,
+    ) -> tokio::sync::oneshot::Receiver<Result<Vec<QueryRow>>> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        gate.send(GateCommand::Query {
+            sql: sql.into(),
+            reply,
+        })
+        .await
+        .unwrap();
+        rx
+    }
+
+    #[tokio::test]
+    async fn a_gated_session_answers_queries_then_starts() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel(1);
+        let serve =
+            tokio::spawn(
+                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
+            );
+
+        let reply = gated_query(&gate_tx, "IDENTIFY_SYSTEM").await;
+        let (tag, payload) = read_frontend(&mut server).await;
+        assert_eq!(tag, b'Q');
+        assert_eq!(payload, b"IDENTIFY_SYSTEM\0");
+        let mut answer = frame(b'T', &[0, 0]);
+        answer.extend(data_row(&[
+            Some(b"7"),
+            Some(b"2"),
+            Some(b"0/16B3748"),
+            None,
+        ]));
+        answer.extend(frame(b'C', b"IDENTIFY_SYSTEM\0"));
+        answer.extend(frame(b'Z', b"I"));
+        server.write_all(&answer).await.unwrap();
+        let rows = reply.await.unwrap().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_deref(), Some(&b"7"[..]));
+        assert_eq!(rows[0][3], None, "NULL stays NULL");
+
+        gate_tx.send(GateCommand::Start).await.unwrap();
+        assert!(
+            matches!(serve.await.unwrap(), Ok(true)),
+            "Start ends the gate"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_error_keeps_the_gated_session_usable() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel(1);
+        let serve =
+            tokio::spawn(
+                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
+            );
+
+        let reply = gated_query(&gate_tx, "TIMELINE_HISTORY 1").await;
+        read_frontend(&mut server).await;
+        let mut answer = frame(b'E', b"Mno history\0\0");
+        answer.extend(frame(b'Z', b"I"));
+        server.write_all(&answer).await.unwrap();
+        assert!(matches!(reply.await.unwrap(), Err(PgWireError::Server(_))));
+
+        let reply = gated_query(&gate_tx, "SELECT 1").await;
+        read_frontend(&mut server).await;
+        let mut answer = data_row(&[Some(b"1")]);
+        answer.extend(frame(b'Z', b"I"));
+        server.write_all(&answer).await.unwrap();
+        assert_eq!(reply.await.unwrap().unwrap().len(), 1);
+
+        drop(gate_tx);
+        assert!(matches!(serve.await.unwrap(), Ok(false)));
+    }
+
+    #[tokio::test]
+    async fn a_closed_gate_terminates_without_starting() {
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel::<GateCommand>(1);
+        drop(gate_tx);
+        let started = WorkerState::serve_gate(&mut gate_rx, &mut worker_end)
+            .await
+            .unwrap();
+        assert!(!started);
+        assert_eq!(read_frontend(&mut server).await.0, b'X', "Terminate sent");
+    }
+
+    #[tokio::test]
+    async fn a_broken_session_ends_the_gate_with_its_error() {
+        let (mut worker_end, server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel(1);
+        let serve =
+            tokio::spawn(
+                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
+            );
+        let reply = gated_query(&gate_tx, "IDENTIFY_SYSTEM").await;
+        drop(server);
+        assert!(reply.await.unwrap().is_err());
+        assert!(serve.await.unwrap().is_err(), "the session ends");
+    }
+
+    #[test]
+    fn a_malformed_data_row_is_a_protocol_error() {
+        let truncated = Bytes::from_static(&[0, 1, 0, 0, 0, 5, b'a']);
+        assert!(matches!(
+            parse_data_row(&truncated),
+            Err(PgWireError::Protocol(_))
+        ));
     }
 
     #[tokio::test]

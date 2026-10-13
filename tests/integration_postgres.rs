@@ -828,6 +828,105 @@ async fn postgres_wait_started_holds_the_slot() -> Result<()> {
     Ok(())
 }
 
+/// Sessions with the given application_name, as the server sees them.
+async fn sessions_named(client: &tokio_postgres::Client, name: &str) -> Result<i64> {
+    Ok(client
+        .query_one(
+            "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+            &[&name],
+        )
+        .await?
+        .get(0))
+}
+
+/// A gated session answers replication commands and SQL on the one
+/// authenticated connection, keeps working after a server error, and streams
+/// only once started. Dropping it before the start ends the session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn postgres_gated_session() -> Result<()> {
+    init_tracing();
+
+    let host_port: u16 = std::env::var("PG_ITEST_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(get_available_port);
+    let container = postgres_image(host_port)
+        .start()
+        .await
+        .expect("start postgres");
+    follow_container_logs(&container).await;
+
+    let client = wait_for_pg_ready(host_port, Duration::from_secs(30)).await?;
+    setup_publication_and_slot(&client, "slot_gate", "pub_gate").await?;
+    let base_lsn = current_wal_lsn(&client).await?;
+    let cfg = replication_config(host_port, "slot_gate", "pub_gate", base_lsn, None)
+        .with_application_name("gated-itest");
+
+    let mut repl = ReplicationClient::connect_gated(cfg.clone()).await?;
+    let system = repl.identify_system().await?;
+    let expected: i64 = client
+        .query_one("SELECT system_identifier FROM pg_control_system()", &[])
+        .await?
+        .get(0);
+    anyhow::ensure!(
+        system.system_id == expected.to_string(),
+        "system_id {} != {expected}",
+        system.system_id
+    );
+    anyhow::ensure!(system.timeline == 1, "timeline {}", system.timeline);
+    anyhow::ensure!(system.xlogpos >= base_lsn, "xlogpos behind {base_lsn}");
+    anyhow::ensure!(system.dbname.as_deref() == Some("postgres"));
+    anyhow::ensure!(sessions_named(&client, "gated-itest").await? == 1);
+
+    // Timeline 1 has no history file: a server error, and the session stays.
+    let err = repl.timeline_history(1).await.expect_err("no history");
+    anyhow::ensure!(err.is_server(), "unexpected error: {err}");
+    let rows = repl.simple_query("SELECT 41 + 1, NULL").await?;
+    anyhow::ensure!(rows.len() == 1);
+    anyhow::ensure!(rows[0][0].as_deref() == Some(&b"42"[..]));
+    anyhow::ensure!(rows[0][1].is_none(), "NULL stays NULL");
+
+    // Not started yet: the slot is free and nothing streams.
+    let slot_active = "SELECT active FROM pg_replication_slots WHERE slot_name = 'slot_gate'";
+    anyhow::ensure!(!client.query_one(slot_active, &[]).await?.get::<_, bool>(0));
+
+    repl.start().await?;
+    tokio::time::timeout(Duration::from_secs(10), repl.wait_started()).await??;
+    anyhow::ensure!(client.query_one(slot_active, &[]).await?.get::<_, bool>(0));
+    let err = repl.simple_query("SELECT 1").await.expect_err("started");
+    anyhow::ensure!(
+        matches!(err, pgwire_replication::PgWireError::Internal(_)),
+        "{err}"
+    );
+
+    client
+        .execute("INSERT INTO t(id, v) VALUES (1, 'a')", &[])
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        anyhow::ensure!(Instant::now() < deadline, "no commit received");
+        match tokio::time::timeout(Duration::from_secs(1), repl.recv()).await {
+            Ok(Ok(Some(ReplicationEvent::Commit { .. }))) => break,
+            Ok(Ok(Some(_))) | Err(_) => {}
+            Ok(Ok(None)) => anyhow::bail!("stream ended"),
+            Ok(Err(e)) => return Err(e.into()),
+        }
+    }
+    repl.stop();
+    let _ = repl.join().await;
+
+    // Dropped before the start: the session ends without starting.
+    let mut dropped = ReplicationClient::connect_gated(cfg).await?;
+    dropped.identify_system().await?;
+    drop(dropped);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while sessions_named(&client, "gated-itest").await? > 0 {
+        anyhow::ensure!(Instant::now() < deadline, "gated session still open");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Ok(())
+}
+
 /// Test error handling: connecting with a nonexistent slot should fail.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn postgres_replication_invalid_slot_error() -> Result<()> {
