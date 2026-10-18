@@ -432,13 +432,30 @@ pub struct ReplicationConfig {
     /// Default: `None` (server defaults apply).
     pub options: Option<String>,
 
-    /// Largest replication message accepted, in bytes.
+    /// Largest backend message **payload** accepted, in bytes.
+    ///
+    /// Measured as the message's length field minus 4, so it excludes the
+    /// 1-byte tag and the 4-byte length field: the bytes on the wire for a
+    /// message at the limit are `max_message_size + 5`.
     ///
     /// The worker sizes its buffer from the length the server announces, so
-    /// this bounds the memory a single message can take. A message over the
-    /// limit ends the stream with a protocol error rather than being buffered.
-    /// A large row or a large logical message is one message, so set this
-    /// above the largest the publication can produce.
+    /// this bounds the memory **one message** can take. A message over the
+    /// limit is refused before any of it is buffered and ends the stream with
+    /// [`PgWireError::MessageTooLarge`](crate::error::PgWireError::MessageTooLarge).
+    /// The refused payload is never consumed, so the connection cannot be
+    /// resumed past it — the reader and connection must be discarded.
+    ///
+    /// It bounds exactly one backend-message payload allocation. It does
+    /// **not** bound an entire transaction (whose changes span many
+    /// messages), the event channel or the decoded events buffered in
+    /// [`buffer_events`](Self::buffer_events), total process memory, or
+    /// aggregate memory across connections.
+    ///
+    /// As a matter of PostgreSQL framing, `pgoutput` writes each row change
+    /// as one `CopyData` message, so a single wide row or a large
+    /// `pg_logical_emit_message()` payload arrives as one message and must
+    /// fit under this limit. Set below that and the stream ends on the first
+    /// such row. That is a statement about framing, not a memory guarantee.
     ///
     /// Default: [`MAX_MESSAGE_SIZE`](crate::protocol::framing::MAX_MESSAGE_SIZE) (1 GiB)
     pub max_message_size: usize,
@@ -641,9 +658,10 @@ impl ReplicationConfig {
         self
     }
 
-    /// Set the largest replication message accepted, in bytes.
+    /// Set the largest backend message payload accepted, in bytes.
     ///
-    /// This can only lower the limit: a value above
+    /// See [`max_message_size`](Self::max_message_size) for what the bound
+    /// covers. This can only lower the limit: a value above
     /// [`MAX_MESSAGE_SIZE`](crate::protocol::framing::MAX_MESSAGE_SIZE) is
     /// capped to it.
     ///

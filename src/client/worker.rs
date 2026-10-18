@@ -987,6 +987,66 @@ mod tests {
         );
     }
 
+    /// The worker must build its reader from `cfg.max_message_size`. Without
+    /// that wiring an oversized frame is accepted and the limit is inert, so
+    /// this fails if `stream_loop` goes back to a default `MessageReader`.
+    #[tokio::test]
+    async fn stream_loop_refuses_a_frame_over_the_configured_limit() {
+        use tokio::io::AsyncWriteExt;
+
+        let cfg = ReplicationConfig {
+            max_message_size: 64,
+            ..Default::default()
+        };
+
+        let progress = Arc::new(SharedProgress::new(Lsn(0)));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let (tx, mut rx) = mpsc::channel(16);
+        let metrics = Arc::new(ReplicationMetrics::default());
+        let mut worker = WorkerState::new(cfg, progress, stop_rx, tx, Arc::clone(&metrics));
+
+        let (worker_end, mut test_end) = tokio::io::duplex(64 * 1024);
+        let worker_task = tokio::spawn(async move {
+            let mut buf = BufReader::with_capacity(1024, worker_end);
+            worker.stream_loop(&mut buf).await
+        });
+
+        // One frame past the 64-byte limit, then a frame the worker would
+        // happily forward if it resynchronized past the refused one.
+        test_end
+            .write_all(&xlog_frame(1, &[b'x'; 200]))
+            .await
+            .unwrap();
+        test_end.write_all(&xlog_frame(2, b"Ismall")).await.unwrap();
+        test_end.flush().await.unwrap();
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(5), worker_task)
+            .await
+            .expect("stream_loop should end on the oversized frame")
+            .unwrap()
+            .expect_err("stream_loop should fail, not return Ok");
+
+        assert!(
+            matches!(
+                err,
+                PgWireError::MessageTooLarge {
+                    limit_bytes: 64,
+                    ..
+                }
+            ),
+            "expected MessageTooLarge, got {err:?}"
+        );
+        assert!(!err.is_transient());
+
+        // Neither the refused frame nor the one behind it reaches the consumer.
+        assert!(
+            rx.try_recv().is_err(),
+            "no event should be emitted for a refused frame"
+        );
+        // And nothing was acknowledged.
+        assert_eq!(metrics.last_applied_lsn(), Lsn(0));
+    }
+
     #[tokio::test]
     async fn start_replication_returns_ok_on_copy_both_response() {
         use std::time::Duration;

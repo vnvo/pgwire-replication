@@ -589,6 +589,18 @@ mod tests {
                 limit_bytes: 8
             }
         ));
+
+        // The verdict is terminal even though it was reached across a
+        // cancellation: the payload arriving afterwards changes nothing.
+        server.write_all(&[b'x'; 32]).await.unwrap();
+        let err = reader.read(&mut client).await.unwrap_err();
+        assert!(matches!(
+            err,
+            PgWireError::MessageTooLarge {
+                payload_bytes: 10_000,
+                limit_bytes: 8
+            }
+        ));
     }
 
     #[tokio::test]
