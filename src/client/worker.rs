@@ -246,11 +246,12 @@ impl WorkerState {
     async fn serve_gate<S: AsyncRead + AsyncWrite + Unpin>(
         gate: &mut mpsc::Receiver<GateCommand>,
         stream: &mut S,
+        max_message_size: usize,
     ) -> Result<bool> {
         loop {
             match gate.recv().await {
                 Some(GateCommand::Query { sql, reply }) => {
-                    let result = simple_query(stream, &sql).await;
+                    let result = simple_query(stream, &sql, max_message_size).await;
                     // A server error leaves the session usable (it ends with
                     // ReadyForQuery); anything else leaves the stream in an
                     // unknown state, so the session ends.
@@ -282,7 +283,7 @@ impl WorkerState {
         self.startup(&mut stream).await?;
         self.authenticate(&mut stream).await?;
         if let Some(mut gate) = self.gate.take() {
-            if !Self::serve_gate(&mut gate, &mut stream).await? {
+            if !Self::serve_gate(&mut gate, &mut stream, self.cfg.max_message_size).await? {
                 return Ok(());
             }
         }
@@ -872,12 +873,16 @@ impl WorkerState {
 async fn simple_query<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     sql: &str,
+    max_message_size: usize,
 ) -> Result<Vec<QueryRow>> {
     write_query(stream, sql).await?;
+    // Rows can be as large as the query makes them: bound them like the
+    // replication stream. A refused message is terminal (the session ends).
+    let mut reader = MessageReader::new().with_max_message_size(max_message_size);
     let mut rows = Vec::new();
     let mut error = None;
     loop {
-        let msg = read_backend_message(stream).await?;
+        let msg = reader.read(stream).await?;
         match msg.tag {
             b'D' => rows.push(parse_data_row(&msg.payload)?),
             b'E' => error = Some(PgWireError::Server(parse_error_response(&msg.payload))),
@@ -1358,10 +1363,14 @@ mod tests {
 
         let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
         let (gate_tx, mut gate_rx) = mpsc::channel(1);
-        let serve =
-            tokio::spawn(
-                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
-            );
+        let serve = tokio::spawn(async move {
+            WorkerState::serve_gate(
+                &mut gate_rx,
+                &mut worker_end,
+                crate::protocol::framing::MAX_MESSAGE_SIZE,
+            )
+            .await
+        });
 
         let reply = gated_query(&gate_tx, "IDENTIFY_SYSTEM").await;
         let (tag, payload) = read_frontend(&mut server).await;
@@ -1395,10 +1404,14 @@ mod tests {
 
         let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
         let (gate_tx, mut gate_rx) = mpsc::channel(1);
-        let serve =
-            tokio::spawn(
-                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
-            );
+        let serve = tokio::spawn(async move {
+            WorkerState::serve_gate(
+                &mut gate_rx,
+                &mut worker_end,
+                crate::protocol::framing::MAX_MESSAGE_SIZE,
+            )
+            .await
+        });
 
         let reply = gated_query(&gate_tx, "TIMELINE_HISTORY 1").await;
         read_frontend(&mut server).await;
@@ -1423,9 +1436,13 @@ mod tests {
         let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
         let (gate_tx, mut gate_rx) = mpsc::channel::<GateCommand>(1);
         drop(gate_tx);
-        let started = WorkerState::serve_gate(&mut gate_rx, &mut worker_end)
-            .await
-            .unwrap();
+        let started = WorkerState::serve_gate(
+            &mut gate_rx,
+            &mut worker_end,
+            crate::protocol::framing::MAX_MESSAGE_SIZE,
+        )
+        .await
+        .unwrap();
         assert!(!started);
         assert_eq!(read_frontend(&mut server).await.0, b'X', "Terminate sent");
     }
@@ -1434,14 +1451,49 @@ mod tests {
     async fn a_broken_session_ends_the_gate_with_its_error() {
         let (mut worker_end, server) = tokio::io::duplex(64 * 1024);
         let (gate_tx, mut gate_rx) = mpsc::channel(1);
-        let serve =
-            tokio::spawn(
-                async move { WorkerState::serve_gate(&mut gate_rx, &mut worker_end).await },
-            );
+        let serve = tokio::spawn(async move {
+            WorkerState::serve_gate(
+                &mut gate_rx,
+                &mut worker_end,
+                crate::protocol::framing::MAX_MESSAGE_SIZE,
+            )
+            .await
+        });
         let reply = gated_query(&gate_tx, "IDENTIFY_SYSTEM").await;
         drop(server);
         assert!(reply.await.unwrap().is_err());
         assert!(serve.await.unwrap().is_err(), "the session ends");
+    }
+
+    #[tokio::test]
+    async fn a_gated_query_row_over_the_limit_ends_the_session() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut worker_end, mut server) = tokio::io::duplex(64 * 1024);
+        let (gate_tx, mut gate_rx) = mpsc::channel(1);
+        let serve = tokio::spawn(async move {
+            WorkerState::serve_gate(&mut gate_rx, &mut worker_end, 64).await
+        });
+
+        let reply = gated_query(&gate_tx, "SELECT big").await;
+        read_frontend(&mut server).await;
+        let mut answer = data_row(&[Some(&[b'x'; 200])]);
+        answer.extend(frame(b'Z', b"I"));
+        server.write_all(&answer).await.unwrap();
+        assert!(matches!(
+            reply.await.unwrap(),
+            Err(PgWireError::MessageTooLarge {
+                limit_bytes: 64,
+                ..
+            })
+        ));
+        assert!(
+            matches!(
+                serve.await.unwrap(),
+                Err(PgWireError::MessageTooLarge { .. })
+            ),
+            "the session ends"
+        );
     }
 
     #[test]

@@ -456,7 +456,9 @@ pub struct ReplicationConfig {
     /// limit is refused before any of it is buffered and ends the stream with
     /// [`PgWireError::MessageTooLarge`](crate::error::PgWireError::MessageTooLarge).
     /// The refused payload is never consumed, so the connection cannot be
-    /// resumed past it — the reader and connection must be discarded.
+    /// resumed past it — the reader and connection must be discarded. The
+    /// same limit bounds each row of a gated session's
+    /// [`simple_query`](crate::ReplicationClient::simple_query).
     ///
     /// It bounds exactly one backend-message payload allocation. It does
     /// **not** bound an entire transaction (whose changes span many
