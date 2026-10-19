@@ -1,6 +1,6 @@
 // examples/basic.rs
 //
-// START_LSN="0/16B6C50" cargo run --example basic --features examples
+// START_LSN="0/16B6C50" cargo run --example basic
 
 use pgwire_replication::{
     client::ReplicationEvent, Lsn, ReplicationClient, ReplicationConfig, TlsConfig,

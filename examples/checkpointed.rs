@@ -1,4 +1,4 @@
-// examples/real/checkpointed.rs
+// examples/checkpointed.rs
 //
 // cargo run --example checkpointed
 

@@ -1,6 +1,6 @@
 // examples/with_tls.rs
 //
-// cargo run --example with_tls --features "examples,tls-rustls"
+// cargo run --example with_tls
 
 #[path = "support/common.rs"]
 mod common;
