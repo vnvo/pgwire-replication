@@ -15,9 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Breaking changes
 - `PgWireError` is now `#[non_exhaustive]`: an exhaustive `match` needs a `_` arm.
-- New `PgWireError::MessageTooLarge` variant, and refusing an oversized message is terminal (see Changed).
+- New `PgWireError::MessageTooLarge` variant. An oversized message now fails with it instead of `PgWireError::Protocol("backend message too large ...")`, so code that matched `Protocol` or its text for this case must match `MessageTooLarge` (or use `is_message_too_large()`). Refusing an oversized message is also terminal (see Changed).
 - New `ReplicationConfig` fields and builders: `ack_lsn` / `with_ack_lsn`, `application_name` / `with_application_name`, `max_message_size` / `with_max_message_size`, `feedback_observer` / `with_feedback_observer`. `ReplicationConfig` is `#[non_exhaustive]`, so code using `new()` / `unix()` and the `with_*` builders compiles unchanged.
-- New `ReplicationClient` APIs: `wait_started`, `connect_gated`, `simple_query`, `identify_system`, `timeline_history`, `start`, `feedback_pending_since`, `carry_feedback_pending`; new public types `FeedbackObserver`, `FeedbackSent`, `IdentifySystem`, `TimelineHistory`, `QueryRow`.
+- New `ReplicationClient` APIs: `wait_started`, `connect_gated`, `simple_query`, `identify_system`, `timeline_history`, `start`, `feedback_pending_since`, `carry_feedback_pending`; new public types `FeedbackObserver`, `FeedbackSent`, `IdentifySystem`, `TimelineHistory`, `QueryRow`; `PgWireError::is_message_too_large()`; `MessageReader::with_max_message_size()`.
 - Standby feedback timing changed: an acknowledged LSN is now sent within `status_interval`, also on an idle stream (see Changed).
 
 ### Added
@@ -37,6 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 - `ReplicationConfig::status_interval` documented a 1 second default; the default is 10 seconds. The README now describes change-driven feedback on an idle stream.
 - The README and example headers told users to pass `--features examples`, which does not exist (cargo rejects it); examples run with plain `cargo run --example <name>`. The README now covers the 0.5 features, error handling and upgrading from 0.4.
+
+### Notes
+- No new runtime dependencies; MSRV stays 1.88. `loom` (under `cfg(pgwire_loom)`) and tokio's `test-util` are dev-only.
+- CI runs a `loom` model of the progress signalling that `update_applied_lsn` and the worker share, and a test that the public types keep `Send`, `Sync`, `Unpin`, `UnwindSafe` and `RefUnwindSafe`.
 
 ---
 
