@@ -27,14 +27,14 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pgwire-replication = "0.4.1"
+pgwire-replication = "0.5.0"
 ```
 
 Or with specific features:
 
 ```toml
 [dependencies]
-pgwire-replication = { version = "0.4.1", default-features = false, features = ["tls-rustls"] }
+pgwire-replication = { version = "0.5.0", default-features = false, features = ["tls-rustls"] }
 ```
 
 ## Requirements
@@ -49,16 +49,21 @@ pgwire-replication = { version = "0.4.1", default-features = false, features = [
 - Explicit LSN seek (`start_lsn`)
 - `pg_logical_emit_message()` support
 - Bounded replay (`stop_at_lsn`)
-- Periodic standby status updates
+- Change-driven standby status updates: an acknowledged LSN reaches the server within `status_interval`, also on an idle stream
+- Initial acknowledged position (`ack_lsn`) independent of the start position
 - Backpressure-safe feedback: keepalives keep flowing even when a slow consumer fills the event buffer, avoiding `wal_sender_timeout` resets
 - Multiple publications per replication slot
 - Optional `pgoutput` binary output format (PG 14+)
-- Pull-based replication metrics (`ReplicationClient::metrics()`)
+- Pull-based replication metrics (`ReplicationClient::metrics()`) and a feedback observer reporting how long acknowledged positions waited
+- Configurable per-message size limit (`max_message_size`), refused with a typed `MessageTooLarge` error
+- Gated sessions: run `IDENTIFY_SYSTEM`, `TIMELINE_HISTORY` or SQL on the replication connection before `START_REPLICATION`
+- Start confirmation (`wait_started`): know when the server accepted `START_REPLICATION` and the slot is held
 - Keepalive handling
 - Tokio-based async client
-- SCRAM-SHA-256 and MD5 authentication
+- SCRAM-SHA-256 authentication (MD5 behind the `md5` feature)
 - TLS/mTLS support (via rustls)
 - Connection-level configs via the startup `options` parameter (e.g. pin `TimeZone`/`IntervalStyle`/`DateStyle` for deterministic decoded output)
+- Configurable startup `application_name`
 - Unix domain socket connections (libpq-compatible: host starts with `/`)
 - Designed for checkpoint and replay-based systems
 
@@ -66,7 +71,7 @@ pgwire-replication = { version = "0.4.1", default-features = false, features = [
 
 This crate intentionally does **not** provide:
 
-- A general-purpose SQL client
+- A general-purpose SQL client (a gated session can run a few queries on the replication connection before it starts streaming, nothing more)
 - Automatic checkpoint persistence
 - Exactly-once semantics
 - Schema management or DDL interpretation
@@ -88,11 +93,12 @@ while let Some(event) = repl.recv().await? {
             repl.update_applied_lsn(wal_end);
         }
         ReplicationEvent::KeepAlive { .. } => {}
+        ReplicationEvent::Begin { .. } | ReplicationEvent::Commit { .. } => {}
         ReplicationEvent::Message { prefix, content, .. } => {
             // User-defined message from pg_logical_emit_message()
             handle_message(prefix, content);
-        }        
-        ReplicationEvent::StoppedAt { reached } => break,
+        }
+        ReplicationEvent::StoppedAt { .. } => break,
     }
 }
 // Clean end-of-stream
@@ -169,6 +175,20 @@ latest applied LSN: a raised LSN within `status_interval` of the last update,
 also on an idle stream, and at once when the server requests a reply.
 For CDC pipelines, progress should typically be reported at **transaction commit boundaries**, not for every message.
 
+### Initial acknowledged position
+
+Until the first `update_applied_lsn`, the worker reports `start_lsn` as flushed and
+applied. A consumer that resumes reading from a position it has not made durable
+(for example, replaying from a slot's `restart_lsn` after a crash) sets `ack_lsn` to
+its durable position instead, so the slot's `confirmed_flush_lsn` never advances
+past what it could recover from:
+
+```rust
+let cfg = ReplicationConfig::new(host, user, password, database, slot, publication)
+    .with_start_lsn(read_from)
+    .with_ack_lsn(durable);
+```
+
 ## Backpressure
 
 The event channel between the worker and your consumer is bounded (`buffer_events`).
@@ -179,6 +199,65 @@ stream (which would force a full replay from `confirmed_flush`). Real backpressu
 still propagates to the server through TCP flow control, and feedback reports only
 the applied LSN, so nothing is acknowledged that the consumer has not durably
 processed.
+
+## Message size limit
+
+`max_message_size` bounds the largest backend message payload the worker accepts
+(default and maximum: 1 GiB). The buffer is sized from the length the server
+announces, so this caps the memory one message can take:
+
+```rust
+let cfg = ReplicationConfig::new(host, user, password, database, slot, publication)
+    .with_max_message_size(64 * 1024 * 1024);
+```
+
+A larger message is refused before any of it is buffered, with
+`PgWireError::MessageTooLarge { payload_bytes, limit_bytes }`. The refusal is
+terminal: the payload may carry WAL changes, so it is never skipped, and the stream
+ends. Each row change arrives as one message, so a single wide row must fit. The
+limit bounds one message, not a transaction, the event buffer or total memory.
+It also bounds each row of a gated session's queries.
+
+## Gated sessions and start confirmation
+
+`connect` returns before the server has accepted `START_REPLICATION`: connecting,
+authentication and the start run in the background worker. `wait_started` returns
+once the server accepted it, when the slot is held by this session, or the
+worker's error if it ended first:
+
+```rust
+let mut client = ReplicationClient::connect(cfg).await?;
+client.wait_started().await?;
+```
+
+`connect_gated` authenticates and then waits. On that one session you can run
+replication commands or SQL with the simple query protocol, then start streaming.
+What you read before the start describes the server the stream opens on, with no
+window for a failover in between:
+
+```rust
+let mut client = ReplicationClient::connect_gated(cfg).await?;
+let system = client.identify_system().await?; // system_id, timeline, xlogpos, dbname
+if system.timeline > 1 {
+    let history = client.timeline_history(system.timeline).await?;
+    // history.filename, history.content
+}
+let rows = client.simple_query("SELECT pg_is_in_recovery()").await?; // text values, None for NULL
+client.start().await?;
+client.wait_started().await?;
+```
+
+A server error from a query leaves the session usable. Dropping the client before
+`start` ends the session without starting replication.
+
+## Startup parameters
+
+- `with_options("-c datestyle=ISO,MDY -c intervalstyle=iso_8601")` sets the startup
+  `options` parameter, like `libpq`'s `options` / `PGOPTIONS`, to pin session GUCs
+  so decoded text values render deterministically.
+- `with_application_name("my-cdc-7f3a")` sets the `application_name` shown in
+  `pg_stat_activity` and `pg_stat_replication` (default `pgwire-replication`), so
+  a consumer can tell its own walsender from other sessions.
 
 ## Multiple publications
 
@@ -230,6 +309,23 @@ println!(
 Counters include events forwarded, feedback sent, keepalive replies, stall count and
 cumulative stall duration, and the last applied / server WAL-end LSNs. Reads never
 block the worker.
+
+A feedback observer reports how long each acknowledged position waited before a
+standby status update told the server about it:
+
+```rust
+use pgwire_replication::FeedbackObserver;
+
+let cfg = cfg.with_feedback_observer(FeedbackObserver::new(|sent| {
+    record_feedback_delay(sent.pending_for); // runs on the worker: keep it cheap
+}));
+```
+
+It is called after each successful update that advanced the reported position.
+Coalesced acknowledgments report the oldest wait. If a session fails before
+reporting, `feedback_pending_since()` on the old client and
+`carry_feedback_pending()` on its replacement keep the wait across sessions.
+Without an observer, no clock is read.
 
 ## Idle behavior
 
@@ -338,6 +434,27 @@ Examples: `0/0`, `0/16B6C50`, `16/B374D848`
 
 Parsing accepts both padded and unpadded forms for compatibility.
 
+## Errors
+
+All errors are `PgWireError`, which is `#[non_exhaustive]`: match it with a `_` arm.
+Predicates such as `is_io()`, `is_server()`, `is_auth()`, `is_tls()`,
+`is_message_too_large()` and `is_transient()` classify an error without matching on
+variants.
+
+## Upgrading from 0.4
+
+- `PgWireError` is now `#[non_exhaustive]`, so an exhaustive `match` needs a `_` arm.
+- New `PgWireError::MessageTooLarge` variant. A refused oversized message is terminal.
+- New `ReplicationConfig` fields (`ack_lsn`, `application_name`, `max_message_size`,
+  `feedback_observer`) and builders. `ReplicationConfig` is `#[non_exhaustive]`, so
+  code that uses `new()` / `unix()` and the `with_*` builders is unaffected.
+- New `ReplicationClient` APIs: `wait_started`, `connect_gated`, `simple_query`,
+  `identify_system`, `timeline_history`, `start`, `feedback_pending_since` and
+  `carry_feedback_pending`.
+- Standby status updates are change-driven: an acknowledged LSN is sent within
+  `status_interval`, also on an idle stream, where it previously waited for the
+  next idle wakeup or server keepalive.
+
 ## TLS support
 
 TLS is optional and uses `rustls`.
@@ -422,7 +539,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## Examples
 
-Examples that use the control-plane SQL client (`tokio-postgres`) require the `examples` feature.
+Examples connect to `127.0.0.1:5432` as `postgres`/`postgres` unless `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSLOT` and `PGPUBLICATION` say otherwise (`control_and_stream` uses these defaults as fixed values). Those that create the publication and slot use `tokio-postgres`, a dev-dependency, so no extra feature is needed.
 
 ### Replication plane only: `examples/basic.rs`
 
@@ -430,7 +547,13 @@ Examples that use the control-plane SQL client (`tokio-postgres`) require the `e
 START_LSN="0/16B6C50" cargo run --example basic
 ```
 
-### Control-plane + streaming: `examples/checkpointed.rs`
+### Control-plane + streaming: `examples/control_and_stream.rs`
+
+```bash
+cargo run --example control_and_stream
+```
+
+### Checkpoint boundaries: `examples/checkpointed.rs`
 
 ```bash
 cargo run --example checkpointed
@@ -494,6 +617,12 @@ Integration tests use Docker via `testcontainers` and are gated behind a feature
 
 ```bash
 cargo test --features integration-tests -- --nocapture
+```
+
+The `loom` model of the progress signalling runs under its own cfg:
+
+```bash
+RUSTFLAGS="--cfg pgwire_loom" CARGO_TARGET_DIR=target/loom cargo test --release --lib loom_model
 ```
 
 # License

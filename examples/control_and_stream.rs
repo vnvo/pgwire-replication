@@ -1,6 +1,6 @@
 // examples/control_and_stream.rs
 //
-// cargo run --example control_and_stream --features examples
+// cargo run --example control_and_stream
 
 use anyhow::Context;
 use pgwire_replication::{

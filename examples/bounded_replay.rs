@@ -1,6 +1,6 @@
 // examples/bounded_replay.rs
 //
-// cargo run --example bounded_replay --features examples
+// cargo run --example bounded_replay
 
 #[path = "support/common.rs"]
 mod common;
